@@ -5,7 +5,7 @@ cylinder axis — the true top-down axial view, in which the 10 mm defect reads 
 a circle sitting inside the 18 mm reference ring, fully surrounded by bone.
 
 The DICOM slice plane is NOT the anatomical axial plane here: the defect
-cylinder axis is oblique (~81 deg off the slice-stacking axis) and differs per
+cylinder axis is oblique (74-88 deg off the slice-stacking axis, mean 81) and differs per
 subject. The axis is recovered by PCA on the output mask itself, the same fit
 3_inference.py uses.
 
@@ -128,7 +128,7 @@ class AxialView:
         print(f'Axis        : {np.round(self.axis, 4)}  (Z,row,col)')
         print(f'Tilt vs Z   : {self.tilt_deg:.1f}°  — the DICOM slice plane is NOT axial here')
         print(f'Eigenvalues : {np.round(self.eigvals, 2)} mm²  '
-              f'[GT template ≈ (5.33, 20.25, 20.25)]')
+              f'[GT template = (5.33, 20.98, 20.99)]')
         print(f'Template    : h={2*g.half_h:.0f} mm, core r≤{g.r_core:.0f} mm, '
               f'ring {g.r_in:.0f}–{g.r_out:.0f} mm')
         print(f'CT subvol   : {self.ct.shape}  (z {self.z0}–{self.z1})')

@@ -13,12 +13,27 @@ subjects share an identical rigid template of ~1,432,500 voxels):
     gap                     = 5.0 < r < 7.0 mm     (excluded)
     reference ring          = 7.0 <= r <= 9.0 mm   (14 mm ID / 18 mm OD annulus)
 
-The cylinder axis is NOT the slice-stacking (Z) axis — it is oblique, and tilts
-by 20-25 degrees from subject to subject. It is recovered here by PCA on the raw
-predicted mask: the U-Net is trained on these oblique cylinders, so the smallest-
-variance eigenvector of its raw output is the cylinder axis (validated against GT:
-smallest eigenvalue 5.47 mm^2 predicted vs 5.33 mm^2 ground truth, where
-h^2/12 = 5.33 for h = 8 mm).
+The cylinder axis is NOT the slice-stacking (Z) axis — it is oblique. Measured
+across all 12 ground-truth subjects it sits 74.5-87.8 degrees off the stacking
+axis (mean 81.3 +/- 4.2), i.e. close to the slice plane, varying ~13 degrees
+between subjects. It is recovered here by PCA on the raw predicted mask: the
+U-Net is trained on these oblique cylinders, so the smallest-variance eigenvector
+of its raw output is the cylinder axis (validated against GT: smallest eigenvalue
+5.47 mm^2 predicted vs 5.33 mm^2 ground truth, where h^2/12 = 5.33 for h = 8 mm).
+
+Validated against ground truth on all 12 labeled subjects: the axis is accurate
+to 1.42 degrees (median 1.32, worst 3.28) and the centre to 0.21 mm (worst 0.46).
+Note that the raw predicted mask is always strongly elongated -- transverse
+eigenvalue ratio ~0.39 against the template's 1.0 -- yet the centroid is still
+accurate to a fifth of a millimetre. Elongation is a second moment and does not
+displace the first moment, so do NOT treat a lopsided mask as evidence of a
+mis-placed centre.
+
+An image-driven re-centring pass (maximising reference-ring-minus-core HU
+contrast) was tried and REJECTED: against GT it moved the centre from 0.21 mm to
+0.73 mm error and helped only 1 of 12 subjects. That contrast metric is a biased
+proxy -- it also asks for a 5-11 degree axis rotation that GT shows would be
+wrong. Do not reintroduce it without held-out ground truth to validate against.
 
 Usage:
     python 3_inference.py --input  /path/to/original_dicom_dir
@@ -61,6 +76,15 @@ CYLINDER_MM     = 5.0    # core radius        (10 mm diameter defect zone)
 RING_INNER_MM   = 7.0    # ring inner radius  (14 mm ID)
 RING_OUTER_MM   = 9.0    # ring outer radius  (18 mm OD)
 BBOX_MARGIN_MM  = 0.0    # GT crop is tight to the cylinder bbox — no margin
+
+# ── Bone threshold (HU) ─────────────────────────────────────────────────────
+# 226 HU is the conventional mineralised-bone threshold in CT-based bone
+# morphometry (the 226 mg HA/cm³ value in the ASBMR / Bouxsein et al. 2010 µCT
+# guidelines). There is no universal number — the guidelines' actual requirement
+# is that you fix one for the study and report it. Air measures -1002 HU in every
+# scan in this study, so HU is calibrated well enough for a fixed value to be
+# comparable across subjects and timepoints. Override with --bone-threshold.
+BONE_THRESHOLD_HU = 226.0
 
 
 def compute_otsu_map(img_norm: np.ndarray) -> np.ndarray:
@@ -225,7 +249,7 @@ def fit_axis(coords_mm: np.ndarray):
 
     The defect annotation is a flat 8 mm slab, so the smallest-variance
     eigenvector is the cylinder axis. For a perfect template the eigenvalues
-    are (h^2/12, R^2/4, R^2/4) = (5.33, 20.25, 20.25) mm^2.
+    measured on all 12 GT volumes are (5.33, 20.98, 20.99) mm^2.
     """
     ctr = coords_mm.mean(axis=0)
     X   = coords_mm - ctr
@@ -239,19 +263,110 @@ def fit_axis(coords_mm: np.ndarray):
     return ctr, axis, w
 
 
+def perp_basis(a: np.ndarray):
+    """Orthonormal basis (e1, e2) spanning the plane perpendicular to axis `a`."""
+    tmp = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1  = np.cross(a, tmp);  e1 /= np.linalg.norm(e1)
+    e2  = np.cross(a, e1);   e2 /= np.linalg.norm(e2)
+    return e1, e2
+
+
+def load_subvolume(slices, geom: 'OrientedCylinder', extra_mm: float, n_slices: int,
+                   orig_h: int, orig_w: int, to_hu: bool = True):
+    """Load the smallest (Z, row, col) block covering the cylinder + extra_mm."""
+    half = geom.bbox_half_mm() + extra_mm
+    lo   = np.floor((geom.c - half) / geom.sp).astype(int)
+    hi   = np.ceil((geom.c + half) / geom.sp).astype(int)
+    z0, z1 = max(0, lo[0]), min(n_slices - 1, hi[0])
+    r0, r1 = max(0, lo[1]), min(orig_h, hi[1] + 1)
+    c0, c1 = max(0, lo[2]), min(orig_w, hi[2] + 1)
+
+    planes = []
+    for z in range(z0, z1 + 1):
+        ds  = pydicom.dcmread(str(slices[z][1]))
+        arr = ds.pixel_array[r0:r1, c0:c1]
+        planes.append(pixel_to_hu(arr, ds) if to_hu else arr.astype(np.float32))
+    sub    = np.stack(planes, axis=0)
+    origin = np.array([z0, r0, c0], dtype=np.float64)
+    return sub, origin
+
+
+def slab_mean(sub, origin, geom: 'OrientedCylinder', e1, e2, fov_mm: float,
+              n_planes: int = 17):
+    """Mean projection through the 8 mm slab on the plane perpendicular to the axis.
+
+    MEAN, not maximum: a maximum-intensity projection fills the defect with any
+    bright bone lying above or below it along the axis, hiding the hole.
+    """
+    step = float(geom.sp.min())
+    uv   = np.arange(-fov_mm, fov_mm + step, step)
+    U, V = np.meshgrid(uv, uv, indexing='ij')
+
+    acc = np.zeros(U.shape, dtype=np.float64)
+    for t in np.linspace(-geom.half_h, geom.half_h, n_planes):
+        p   = (geom.c[None, None, :]
+               + t * geom.a[None, None, :]
+               + U[..., None] * e1[None, None, :]
+               + V[..., None] * e2[None, None, :])
+        idx = (p / geom.sp[None, None, :]) - origin[None, None, :]
+        acc += map_coordinates(sub, [idx[..., 0], idx[..., 1], idx[..., 2]],
+                               order=1, mode='nearest')
+    return acc / n_planes, uv, U, V
+
+
+def report_defect_offset(slices, geom: 'OrientedCylinder', n_slices: int,
+                         orig_h: int, orig_w: int, bone_thresh_hu: float):
+    """How far is the low-density defect void from the protocol ROI centre?
+
+    DIAGNOSTIC ONLY — the ROI is not moved. Validated against ground truth, the
+    fitted centre reproduces the annotation protocol to 0.21 mm, so a non-zero
+    offset here is not a placement error: it means the defect has remodelled away
+    from the original trephine site. That is a finding about the biology, and it
+    is the quantity to report rather than to correct.
+
+    Returns a dict, or None if the void is too small to have a stable centroid.
+    """
+    e1, e2 = perp_basis(geom.a)
+    fov = geom.r_out
+    sub, origin = load_subvolume(slices, geom, 4.0, n_slices, orig_h, orig_w)
+    slab, uv, U, V = slab_mean(sub, origin, geom, e1, e2, fov)
+
+    d2 = U ** 2 + V ** 2
+    inside = d2 <= geom.r_out ** 2
+    void = inside & (slab < bone_thresh_hu)
+    if void.sum() < 50:
+        return None
+
+    w = (bone_thresh_hu - slab[void])          # weight by how far below bone
+    w = np.maximum(w, 0.0)
+    if w.sum() <= 0:
+        return None
+    du = float((U[void] * w).sum() / w.sum())
+    dv = float((V[void] * w).sum() / w.sum())
+    frac = float(void.sum()) / float(inside.sum())
+    return dict(du=du, dv=dv, dist=float(np.hypot(du, dv)), void_frac=frac)
+
+
 def write_series(slices, geom: 'OrientedCylinder', kind: str, output_dir: Path,
                  row_min, crop_h, col_min, crop_w,
                  row_cos, col_cos, row_sp, col_sp,
                  z_lo: int, z_hi: int,
-                 apply_otsu: bool = False):
+                 bone_thresh_hu: float = None):
     """Write one DICOM series (cropped, masked) to output_dir.
 
     Slices outside [z_lo, z_hi] are written as all-zero, matching the GT format
     where every instance is present but only the defect block carries data.
 
-    When apply_otsu=True the geometric mask is further AND-ed with a per-slice
-    Otsu bone map so only calcified/bone voxels survive within the ROI.  This
-    is useful for bone-volume-fraction (BV/TV) quantification.
+    When bone_thresh_hu is given, the geometric mask is further AND-ed with
+    HU > bone_thresh_hu so only mineralised voxels survive within the ROI.
+
+    A FIXED HU threshold is used deliberately. The earlier implementation ran
+    Otsu over the whole 1200x1200 slice, which is overwhelmingly air, so the
+    threshold landed near -150 HU and separated specimen from air rather than
+    bone from soft tissue -- it reported ~81% "bone" inside an unbridged defect.
+    A fixed value is also the reproducible choice across timepoints, which a
+    per-slice adaptive threshold is not. Air measures -1002 HU consistently in
+    every scan in this study, so HU is calibrated and comparable.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     n_active = 0
@@ -262,10 +377,10 @@ def write_series(slices, geom: 'OrientedCylinder', kind: str, output_dir: Path,
 
         if z_lo <= i <= z_hi:
             m = geom.slice_mask(i, kind, row_min, crop_h, col_min, crop_w)
-            if apply_otsu and m.any():
-                hu   = pixel_to_hu(ds.pixel_array, ds)
-                otsu = compute_otsu_map(normalize_hu(hu)).astype(bool)
-                m &= otsu[row_min:row_min + crop_h, col_min:col_min + crop_w]
+            if bone_thresh_hu is not None and m.any():
+                hu = pixel_to_hu(ds.pixel_array, ds)[row_min:row_min + crop_h,
+                                                     col_min:col_min + crop_w]
+                m &= hu > bone_thresh_hu
             cropped[~m] = 0
             if m.any():
                 n_active += 1
@@ -299,8 +414,7 @@ def write_series(slices, geom: 'OrientedCylinder', kind: str, output_dir: Path,
 
 
 def write_axial_preview(slices, geom: 'OrientedCylinder', out_png: Path,
-                        z_lo: int, z_hi: int, row_min: int, crop_h: int,
-                        col_min: int, crop_w: int):
+                        n_slices: int, orig_h: int, orig_w: int):
     """Reslice the CT PERPENDICULAR to the fitted axis and save a PNG.
 
     This is the true top-down axial view: the defect appears as a circle
@@ -310,21 +424,17 @@ def write_axial_preview(slices, geom: 'OrientedCylinder', out_png: Path,
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    # Load only the subvolume covering the cylinder (~200^3, not 1200^3)
-    sub = np.stack([
-        pydicom.dcmread(str(slices[i][1])).pixel_array[
-            row_min:row_min + crop_h, col_min:col_min + crop_w]
-        for i in range(z_lo, z_hi + 1)
-    ], axis=0).astype(np.float32)
-    origin = np.array([z_lo, row_min, col_min], dtype=np.float64)
+    a       = geom.a
+    e1, e2  = perp_basis(a)
+    fov     = geom.r_out + 2.0
 
-    # Orthonormal basis spanning the plane perpendicular to the axis
-    a   = geom.a
-    tmp = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    e1  = np.cross(a, tmp);  e1 /= np.linalg.norm(e1)
-    e2  = np.cross(a, e1);   e2 /= np.linalg.norm(e2)
+    # Load enough to fill the whole field of view. The written crop box is tight
+    # to the cylinder's bounding box, which is narrower than `fov` in the
+    # transverse directions, so loading only that box would clip the ring off the
+    # edge of the preview.
+    sub, origin = load_subvolume(slices, geom, fov - geom.r_out + 2.0,
+                                 n_slices, orig_h, orig_w, to_hu=False)
 
-    fov  = geom.r_out + 2.0
     step = float(geom.sp.min())
     uv   = np.arange(-fov, fov + step, step)
     U, V = np.meshgrid(uv, uv, indexing='ij')
@@ -426,10 +536,21 @@ def main():
                         help='Min non-zero px per slice to keep (removes noise blobs, default 200)')
     parser.add_argument('--margin-mm', type=float, default=BBOX_MARGIN_MM,
                         help='Extra padding around the crop box (default 0, matching GT)')
-    parser.add_argument('--otsu-refine', action='store_true',
-                        help='Also write *_cylinder_bone and *_ring_bone series '
-                             'where the geometric mask is AND-ed with a per-slice '
-                             'Otsu bone map (useful for BV/TV quantification)')
+    parser.add_argument('--bone-refine', '--otsu-refine', action='store_true',
+                        dest='bone_refine',
+                        help='Also write *_cylinder_bone and *_ring_bone series, '
+                             'the geometric ROI AND-ed with HU > --bone-threshold. '
+                             '(--otsu-refine is a deprecated alias; it no longer '
+                             'uses Otsu, which was not a bone threshold.)')
+    parser.add_argument('--bone-threshold', type=float, default=BONE_THRESHOLD_HU,
+                        help=f'Bone threshold in HU for --bone-refine '
+                             f'(default {BONE_THRESHOLD_HU:.0f}). Report whichever '
+                             'value you use, and keep it fixed across timepoints.')
+    parser.add_argument('--report-defect-offset', action='store_true',
+                        help='Diagnostic only, changes no output: report how far the '
+                             'low-density defect centroid sits from the protocol ROI '
+                             'centre. This is a measure of remodelling, NOT an error '
+                             'to correct — the ROI is deliberately not moved.')
     parser.add_argument('--no-axial-preview', action='store_true',
                         help='Skip the perpendicular-to-axis axial view PNG')
     args = parser.parse_args()
@@ -558,7 +679,7 @@ def main():
           f'{np.round(center_mm, 2)} mm')
     print(f'  axis   (Z,row,col)   : {np.round(axis, 4)}')
     print(f'  eigenvalues (mm²)    : {np.round(eigvals, 2)}   '
-          f'[GT template ≈ (5.33, 20.25, 20.25)]')
+          f'[GT template = (5.33, 20.98, 20.99)]')
     tilt = np.degrees(np.arccos(min(1.0, abs(axis[0]))))
     print(f'  tilt from slice axis : {tilt:.1f}°  '
           f'(a Z-aligned stamp would be {tilt:.0f}° wrong)')
@@ -569,8 +690,11 @@ def main():
 
     # ── Crop box + active Z range from the cylinder's own bounding box ───────
     half = geom.bbox_half_mm() + args.margin_mm
-    lo   = (center_mm - half) / spacing
-    hi   = (center_mm + half) / spacing
+    # Crop from geom.c, the centre the mask is actually stamped at — not from a
+    # separate centre variable. If the two ever diverge the ring is clipped off the
+    # edge of the box, and the ROI check below is what catches it.
+    lo   = (geom.c - half) / spacing
+    hi   = (geom.c + half) / spacing
 
     z_lo = max(0,      int(np.floor(lo[0])))
     z_hi = min(n - 1,  int(np.ceil(hi[0])))
@@ -584,6 +708,26 @@ def main():
     print(f'\nActive Z    : {z_lo} → {z_hi}  ({z_hi - z_lo + 1} slices)')
     print(f'Bounding box: rows {row_min}→{row_max} ({crop_h} px)  '
           f'cols {col_min}→{col_max} ({crop_w} px)')
+
+    # ── Verify the crop window holds the whole template ──────────────────────
+    # The ROI is a fixed-size rigid template, so its voxel count is known in
+    # advance. If the window clips it — a shifted centre, or a defect near the
+    # edge of the reconstructed volume — the ROI silently shrinks and every
+    # volume and BV/TV number downstream is wrong. Check rather than assume.
+    voxel_mm3 = float(np.prod(spacing))
+    analytic  = (np.pi * CYLINDER_MM ** 2 * CYL_HEIGHT_MM
+                 + np.pi * (RING_OUTER_MM ** 2 - RING_INNER_MM ** 2) * CYL_HEIGHT_MM)
+    enclosed  = sum(int(geom.slice_mask(z, 'union', row_min, crop_h,
+                                       col_min, crop_w).sum())
+                    for z in range(z_lo, z_hi + 1)) * voxel_mm3
+    frac = enclosed / analytic
+    print(f'ROI check   : {enclosed:.2f} / {analytic:.2f} mm³ enclosed '
+          f'({100 * frac:.2f}% of the template)')
+    if frac < 0.999:
+        print(f'  WARNING: the crop window clips {100 * (1 - frac):.2f}% of the ROI. '
+              'Volumes and BV/TV from this run will be under-reported. '
+              'Raise --margin-mm, or the defect may sit too close to the edge '
+              'of the reconstructed volume.')
 
     union_dir = output_dir
     cyl_dir   = output_dir.parent / (output_dir.name + '_cylinder')
@@ -603,19 +747,41 @@ def main():
     print(f'\nPass 4 — writing {2*RING_OUTER_MM:.0f} mm reference ring series...')
     write_series(slices, geom, 'ring', ring_dir, **write_kw)
 
-    if args.otsu_refine:
+    if args.bone_refine:
+        thr = args.bone_threshold
         cyl_bone_dir  = output_dir.parent / (output_dir.name + '_cylinder_bone')
         ring_bone_dir = output_dir.parent / (output_dir.name + '_ring_bone')
-        print('\nPass 5 — writing Otsu-refined core cylinder (bone only)...')
-        write_series(slices, geom, 'cylinder', cyl_bone_dir, apply_otsu=True, **write_kw)
-        print('\nPass 6 — writing Otsu-refined reference ring (bone only)...')
-        write_series(slices, geom, 'ring', ring_bone_dir, apply_otsu=True, **write_kw)
+        print(f'\nPass 5 — core cylinder, bone only (HU > {thr:.0f})...')
+        write_series(slices, geom, 'cylinder', cyl_bone_dir,
+                     bone_thresh_hu=thr, **write_kw)
+        print(f'\nPass 6 — reference ring, bone only (HU > {thr:.0f})...')
+        write_series(slices, geom, 'ring', ring_bone_dir,
+                     bone_thresh_hu=thr, **write_kw)
+        print(f'\n  BV/TV denominators are the matching all-tissue series. Note the '
+              f'\n  {CYL_HEIGHT_MM:.0f} mm ROI height spans well beyond the calvarial plate '
+              f'(~3.5-4 mm),\n  so absolute BV/TV is geometrically diluted and is NOT '
+              'comparable to\n  published BV/TV. The core-to-ring ratio cancels that '
+              'dilution.')
+
+    if args.report_defect_offset:
+        print('\nDefect-void offset (diagnostic — ROI NOT moved)...')
+        off = report_defect_offset(slices, geom, n, orig_h, orig_w,
+                                   args.bone_threshold)
+        if off is None:
+            print('  void too small for a stable centroid — skipped')
+        else:
+            print(f'  low-density centroid : ({off["du"]:+.2f}, {off["dv"]:+.2f}) mm '
+                  f'from the ROI centre  → {off["dist"]:.2f} mm')
+            print(f'  void fraction in ROI : {100*off["void_frac"]:.1f}%')
+            print('  The fitted centre reproduces the annotation protocol to 0.21 mm '
+                  '(GT-validated),\n  so this offset reflects remodelling away from the '
+                  'trephine site, not misplacement.')
 
     if not args.no_axial_preview:
         print('\nRendering axial view (⟂ to fitted axis)...')
         write_axial_preview(slices, geom,
                             output_dir.parent / (output_dir.name + '_axial_view.png'),
-                            z_lo, z_hi, row_min, crop_h, col_min, crop_w)
+                            n, orig_h, orig_w)
 
     print('\nDone.')
 
