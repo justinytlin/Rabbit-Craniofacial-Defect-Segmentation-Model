@@ -37,6 +37,12 @@ POS_OVERSAMPLE = 5
 SAVE_EVERY     = 10
 RANDOM_SEED    = 42
 
+# ── 2.5D + Z-position mode ──────────────────────────────────────────────────
+# IN_CHANNELS = 7: prev slice (HU+Otsu) + curr slice (HU+Otsu) + next slice (HU+Otsu) + Z-pos
+# IN_CHANNELS = 2: original single-slice mode (HU + Otsu only)
+# NOTE: changing this requires retraining from scratch; existing best_model.pth uses 2.
+IN_CHANNELS = 7
+
 
 def compute_otsu_map(img_norm: np.ndarray) -> np.ndarray:
     """
@@ -72,7 +78,13 @@ def get_device():
 
 
 class DefectDataset(Dataset):
-    """Loads all slices from a list of (image, mask, otsu_map) numpy array triples."""
+    """Loads all slices; supports 2D (IN_CHANNELS=2) and 2.5D+Z-pos (IN_CHANNELS=7) modes.
+
+    2.5D mode stacks three consecutive slices (prev / curr / next) each with two
+    channels (HU + Otsu) = 6 channels, plus a normalised Z-position channel = 7 total.
+    Spatial augmentations (flip, rotate) are applied consistently across all three
+    slices so relative geometry is preserved.
+    """
 
     def __init__(self, images: np.ndarray, masks: np.ndarray,
                  otsu_maps: np.ndarray, augment: bool = True):
@@ -80,58 +92,77 @@ class DefectDataset(Dataset):
         self.masks     = masks      # (N, 512, 512) uint8
         self.otsu_maps = otsu_maps  # (N, 512, 512) float32 binary
         self.augment   = augment
+        self.n         = len(images)
 
     def __len__(self):
-        return len(self.images)
+        return self.n
 
     def __getitem__(self, idx):
-        img  = self.images[idx].copy()     # (512, 512) float32
-        mask = self.masks[idx].copy()      # (512, 512) uint8
-        otsu = self.otsu_maps[idx].copy()  # (512, 512) float32
+        img  = self.images[idx].copy()
+        mask = self.masks[idx].copy()
+        otsu = self.otsu_maps[idx].copy()
 
-        # Downsample 512 → TRAIN_SIZE for faster training (nearest-neighbor)
+        # Downsample 512 → TRAIN_SIZE (nearest-neighbor for speed)
         s = 512 // TRAIN_SIZE
         if s > 1:
             img  = img[::s, ::s]
             otsu = otsu[::s, ::s]
-            # For mask use max-pool to avoid missing thin edges
             h, w = mask.shape
             mask = mask.reshape(h // s, s, w // s, s).max(axis=(1, 3))
 
+        # ── Sample spatial augmentation params once for all slices ─────────
+        do_hflip = do_vflip = False
+        rot_k    = 0
+        intensity_delta = 0.0
+        intensity_scale = 1.0
         if self.augment:
-            img, mask, otsu = self._augment(img, mask, otsu)
+            do_hflip = random.random() < 0.5
+            do_vflip = random.random() < 0.5
+            rot_k    = random.randint(0, 3)
+            if random.random() < 0.5:
+                intensity_delta = random.uniform(-0.08, 0.08)
+            if random.random() < 0.5:
+                intensity_scale = random.uniform(0.9, 1.1)
 
-        # Channel 0: HU-normalised image; channel 1: Otsu bone binary map
-        inp_t  = torch.from_numpy(np.stack([img, otsu], axis=0))  # (2, H, W)
+        def _spatial(arr):
+            """Apply spatial transforms (identical for all slices in the stack)."""
+            if do_hflip: arr = np.fliplr(arr).copy()
+            if do_vflip: arr = np.flipud(arr).copy()
+            if rot_k:    arr = np.rot90(arr, rot_k).copy()
+            return arr
+
+        img  = _spatial(img)
+        mask = _spatial(mask)
+        otsu = _spatial(otsu)
+        # Intensity jitter on HU only (Otsu map stays binary)
+        img  = np.clip(img * intensity_scale + intensity_delta, 0.0, 1.0)
+
+        if IN_CHANNELS == 7:
+            # ── 2.5D: load neighbouring slices and apply same spatial aug ─
+            def _load_neighbor(i):
+                im = self.images[i].copy()
+                ot = self.otsu_maps[i].copy()
+                if s > 1:
+                    im = im[::s, ::s]
+                    ot = ot[::s, ::s]
+                return _spatial(im), _spatial(ot)
+
+            im_prev, ot_prev = _load_neighbor(max(0, idx - 1))
+            im_next, ot_next = _load_neighbor(min(self.n - 1, idx + 1))
+
+            # Z-position: normalised index [0, 1] broadcast across H×W
+            z_pos = np.full_like(img, fill_value=(idx / max(self.n - 1, 1)), dtype=np.float32)
+
+            # 7 channels: [prev_HU, prev_Otsu, curr_HU, curr_Otsu, next_HU, next_Otsu, Z_pos]
+            inp_t = torch.from_numpy(np.stack([
+                im_prev, ot_prev, img, otsu, im_next, ot_next, z_pos
+            ], axis=0))  # (7, H, W)
+        else:
+            # Original 2-channel mode
+            inp_t = torch.from_numpy(np.stack([img, otsu], axis=0))  # (2, H, W)
+
         mask_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)  # (1, H, W)
         return inp_t, mask_t
-
-    @staticmethod
-    def _augment(img, mask, otsu):
-        # Horizontal flip
-        if random.random() < 0.5:
-            img  = np.fliplr(img).copy()
-            mask = np.fliplr(mask).copy()
-            otsu = np.fliplr(otsu).copy()
-        # Vertical flip
-        if random.random() < 0.5:
-            img  = np.flipud(img).copy()
-            mask = np.flipud(mask).copy()
-            otsu = np.flipud(otsu).copy()
-        # 90-degree rotation (0, 90, 180, 270)
-        k = random.randint(0, 3)
-        if k > 0:
-            img  = np.rot90(img,  k).copy()
-            mask = np.rot90(mask, k).copy()
-            otsu = np.rot90(otsu, k).copy()
-        # Intensity jitter on HU channel only (Otsu map stays binary)
-        if random.random() < 0.5:
-            delta = random.uniform(-0.08, 0.08)
-            img   = np.clip(img + delta, 0.0, 1.0)
-        if random.random() < 0.5:
-            scale = random.uniform(0.9, 1.1)
-            img   = np.clip(img * scale, 0.0, 1.0)
-        return img, mask, otsu
 
 
 def load_all_npz(prepared_dir: Path):
@@ -243,9 +274,9 @@ def main():
         drop_last=True,
     )
 
-    model = UNet(in_channels=2, out_channels=1, features=(32, 64, 128, 256))
+    model = UNet(in_channels=IN_CHANNELS, out_channels=1, features=(32, 64, 128, 256))
     model = model.to(device)
-    print(f'Model parameters: {count_parameters(model):,}')
+    print(f'Model in_channels: {IN_CHANNELS}  |  parameters: {count_parameters(model):,}')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)

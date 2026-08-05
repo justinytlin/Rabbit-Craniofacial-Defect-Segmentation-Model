@@ -5,10 +5,12 @@ their original DICOM directory and ground-truth _output_dicom directory.
 Verifies file counts and flags any issues.
 """
 
+import argparse
 import csv
 import sys
 from pathlib import Path
 
+# Root holding the per-group subject folders. Override with --base on another machine.
 BASE = Path('/Volumes/justinytlin/Craniofacial/Radiomics/In Vivo CT Data/PDLLA RAW DICOM VIVO DATA')
 
 SUBJECTS = [
@@ -52,12 +54,25 @@ def count_dcm(directory: Path) -> int:
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description='Build data/subjects.csv from the raw DICOM tree')
+    parser.add_argument('--base', default=str(BASE),
+                        help='Root holding the Defect/, MC/, ... group folders '
+                             '(default: the path this study was authored against)')
+    args = parser.parse_args()
+    base = Path(args.base)
+
+    if not base.exists():
+        print(f'ERROR: base directory not found: {base}')
+        print('Pass --base /path/to/PDLLA RAW DICOM VIVO DATA')
+        sys.exit(1)
+
     rows = []
     errors = []
 
     for sid, group, orig_rel, out_rel in SUBJECTS:
-        orig_dir = BASE / orig_rel
-        out_dir  = BASE / out_rel
+        orig_dir = base / orig_rel
+        out_dir  = base / out_rel
 
         n_orig = count_dcm(orig_dir)
         n_out  = count_dcm(out_dir)
