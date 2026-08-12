@@ -107,27 +107,30 @@ bone quality, and **is not comparable to published BV/TV values**. The
 **core-to-ring ratio** is the meaningful measure, because the dilution cancels.
 Report that, and state the threshold and ROI height alongside it.
 
-Measured at 226 HU, the reference ring lands at 44.3% and 43.9% on the two 6-month
-scans — right at the 44–50% ceiling dilution predicts. So the ring is essentially
-fully mineralised within the plate, which is what makes it a usable reference.
+Measured at 226 HU on the four registration-placed 6-month outputs, the reference
+ring lands at 39.9–43.4% — at the ceiling dilution predicts. So the ring is
+essentially fully mineralised within the plate, which is what makes it a usable
+reference.
 
 #### The threshold changes the biological conclusion
 
 The core-to-ring ratio is strongly threshold-dependent, because the defect contains
-low-density woven bone that a high threshold excludes and a low one counts:
+low-density woven bone that a high threshold excludes and a low one counts.
+Registration-placed 6-month outputs (three untreated Defect animals + one
+Defect+PDLLA):
 
-| threshold | 37952 6m | 41122 6m |
-|---|---|---|
-| 226 HU | 0.79× | 0.82× |
-| 500 HU | 0.40× | 0.47× |
-| ~700–800 HU | 0.31× | 0.40× |
+| threshold | 37951 | 37952 | 41122 | 38743 (PDLLA) |
+|---|---|---|---|---|
+| 226 HU | 0.79× | 0.74× | 0.83× | 0.89× |
+| 500 HU | 0.31× | 0.33× | 0.42× | 0.49× |
 
-At 226 HU the defect reads as ~80% as mineralised as intact bone; at 500+ HU it
-reads as under half. Both are defensible and they answer different questions — 226
-HU asks "how much mineralised tissue is there," a higher threshold asks "how much
-*mature* bone is there." Pick deliberately with your supervisor, fix it for the
-whole study, and state it with every number. Do not compare ratios computed at
-different thresholds.
+At 226 HU the defects read as 74–89% as mineralised as intact bone; at 500 HU as
+under half. Both are defensible and they answer different questions — 226 HU asks
+"how much mineralised tissue is there," a higher threshold asks "how much *mature*
+bone is there." Pick deliberately with your supervisor, fix it for the whole
+study, and state it with every number. Do not compare ratios computed at different
+thresholds — and do not compare numbers from network-placed and
+registration-placed ROIs, either.
 
 Useful flags: `--threshold` (sigmoid cutoff, default 0.5), `--min-blob-area`
 (drops small false-positive blobs, default 200 px), `--min-active-slices` (warns
@@ -140,10 +143,11 @@ land close to that. A tilt near 0°, or eigenvalues an order of magnitude larger
 means the mask was a diffuse blob rather than a defect and the ROI is misplaced —
 discard it rather than measuring it.
 
-### Accuracy against ground truth
+### Accuracy against ground truth — depends on the timepoint
 
-Measured on all 12 labeled subjects, comparing the PCA fit of the *prediction*
-against the PCA fit of the *ground-truth mask* in the same full-frame coordinates:
+**On 3-month scans** (the training timepoint), measured on all 12 labeled
+subjects, comparing the PCA fit of the *prediction* against the PCA fit of the
+*ground-truth mask* in the same full-frame coordinates:
 
 | | mean | median | worst |
 |---|---|---|---|
@@ -152,6 +156,22 @@ against the PCA fit of the *ground-truth mask* in the same full-frame coordinate
 
 These are training-set numbers — there is no validation split — so treat them as
 an upper bound on accuracy, not a held-out estimate.
+
+**On later timepoints the network's placement is measurably biased.** Rigidly
+registering the known 3-month trephine sites onto the same animals' 6-month scans
+(skull-local registration, bone-mask dice 0.72–0.75) puts the network's 6-month
+ROI **2.2–3.2 mm off the true site** for untreated defects, displaced toward the
+ingrown bone edge — part-healed defects are outside its training distribution.
+Corrected for that placement error, the residual void in untreated defects sits
+0.7–1.2 mm from the trephine site: untreated holes do not migrate; the apparent
+"void offset" was mostly the network's error. (A PDLLA-treated animal placed to
+1.31 mm, with a genuinely off-centre residual void of 3.2 mm — asymmetric
+healing does exist; the point is you cannot tell which case you have from one
+image alone.)
+
+**Consequence: do not use raw network placement for any timepoint except
+3 months.** Run `3_inference.py` for detection, then fix the placement with
+`4_propagate_roi.py` (next section).
 
 One counterintuitive detail worth recording, because it misleads: **the raw
 predicted mask is always strongly elongated.** Its transverse eigenvalue ratio is
@@ -175,19 +195,66 @@ objective for both centre and orientation — plausibly because tilting or shift
 seats the 8 mm ring better against a domed skull, raising ring HU without being
 anatomically right.
 
-Do not reintroduce it without held-out ground truth to validate against.
+Do not reintroduce it without held-out ground truth to validate against — and
+note the postscript below, because this story had one more turn.
 
-The reason it looked convincing is worth stating plainly, because the core really
-does sit off the visible defect on late timepoints. That observation prompted this
-whole investigation — and it was confirmed to be an observation about the *defect*,
-not the ROI: the reference annotations were outlining the visible defect boundary,
-not re-placing the protocol template. The ROI is meant to hold the original
-trephine site so measurements stay comparable across timepoints; the defect
-remodels away from it.
+**Postscript — the visual observation was right after all.** The re-centring was
+rejected on 3-month ground truth, where the network's placement is already
+accurate and shifting onto the residual void degrades it. But the observation
+that prompted it — the core visibly off the defect on *6-month* scans — was later
+confirmed by cross-timepoint registration to be a real ~2–3 mm network placement
+error at that timepoint (see the accuracy section above). On the untreated
+6-month scans the contrast shift was pointing approximately at the true trephine
+site. It stays removed anyway: it corrects the wrong thing on 3-month scans,
+and on treated animals with genuinely asymmetric healing (38743) it would drag a
+correctly-placed ROI onto the void. Registration (`4_propagate_roi.py`) fixes
+placement using anatomy instead of a heuristic, and works in both cases.
 
-Use `--report-defect-offset` to measure that separation instead of correcting it.
-On the two 6-month scans it reads 2.46 mm and 2.53 mm, consistently in the same
-direction — a remodelling result in its own right.
+## Cross-timepoint placement — `4_propagate_roi.py`
+
+For any scan that is not a 3-month scan, place the ROI by registration from the
+animal's earlier trusted ROI instead of trusting the network:
+
+```bash
+python 3_inference.py --input 6m_dicom_dir --output SUBJ_6m_output_dicom   # detection + hint
+python 4_propagate_roi.py \
+    --ref-input    3m_dicom_dir  --ref-roi    SUBJ_output_dicom \
+    --target-input 6m_dicom_dir  --target-roi SUBJ_6m_output_dicom \
+    --output SUBJ_6m_output_dicom --bone-refine
+```
+
+The reference ROI is the 3-month ground-truth series when one exists, or a
+3-month *prediction* otherwise (that timepoint is in-distribution for the
+network). Registration is skull-local — a 48 mm box around the defect, largest
+connected bone component, signed distance maps — because the full field of view
+contains paws, a positioning tube and a dish that stay put while the head moves,
+and whole-volume registration locks onto the hardware. Rotation is initialised
+from the two defect axes with a 12-way spin multi-start.
+
+It refuses to write anything if the bone-mask dice after registration is below
+`--dice-min` (default 0.5), and prints how far the network's placement was from
+the registered site. Output series are identical in format to `3_inference.py`'s.
+
+`--wide-search` extends the rotation multi-start with tilt perturbations (±12°,
+±24°) for cases where the network hint's axis is unreliable. `--target-fit`
+accepts the JSON from `3_inference.py --fit-only` so the network's throwaway
+series never have to be written at all.
+
+Measured on the full 42-scan study: 41 of 42 scans placed automatically (dice
+0.59–0.75). The one failure — a scan re-exported at 0.2 mm instead of 0.1 mm,
+with no InstanceNumber, a large head-pose change, and a healed defect — was
+correctly *refused* by the dice gate rather than silently mis-measured, across
+four escalating configurations. If a scan fails the gate, prefer re-exporting it
+at original resolution over lowering `--dice-min`.
+
+### Throughput
+
+One scan takes ~4–5 minutes unattended (Apple M-series): ~1–2 min for the
+prediction pass (`--fit-only --fast-fit`, batched GPU inference with threaded
+DICOM reads) plus ~2–3 min for registration and writing all five series in a
+single pass over the source slices. The naive per-slice, per-series pipeline was
+~3× slower; the network itself was never the bottleneck — DICOM I/O and full-
+resolution mask post-processing were.
 
 ## Visualization
 
@@ -261,6 +328,7 @@ to train the 2.5D variant from scratch.
 1_prepare_dataset.py     pair scans with ground truth → data/prepared/*.npz
 2_train.py               train the U-Net
 3_inference.py           predict + stamp the ROI template → DICOM series
+4_propagate_roi.py       place later-timepoint ROIs by registration (use it!)
 model.py                 U-Net, Dice / focal / combined losses
 axial_view.py            reslice perpendicular to the fitted defect axis
 visualize_output.ipynb   inspect outputs, ROI volumes, BV/TV

@@ -9,3 +9,6 @@ scipy>=1.11.0
 # Visualization (visualize_output.ipynb, axial_view.AxialView.interactive)
 jupyter>=1.0.0
 ipywidgets>=8.0.0
+
+# Cross-timepoint ROI propagation (4_propagate_roi.py)
+SimpleITK>=2.3.0

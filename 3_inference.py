@@ -35,6 +35,13 @@ contrast) was tried and REJECTED: against GT it moved the centre from 0.21 mm to
 proxy -- it also asks for a 5-11 degree axis rotation that GT shows would be
 wrong. Do not reintroduce it without held-out ground truth to validate against.
 
+THE 0.21 mm FIGURE IS 3-MONTH-ONLY. Rigid registration of the known 3-month
+trephine sites onto the same animals' 6-month scans measured the network's
+6-month placement at 2.2-3.2 mm off (biased toward the ingrown bone edge) --
+part-healed defects are out of its training distribution. For any timepoint
+other than 3 months, run this script for detection, then fix the placement with
+4_propagate_roi.py (registration from the animal's earlier trusted ROI).
+
 Usage:
     python 3_inference.py --input  /path/to/original_dicom_dir
                           --output /path/to/SUBJECTID_output_dicom
@@ -413,6 +420,86 @@ def write_series(slices, geom: 'OrientedCylinder', kind: str, output_dir: Path,
           f'({total_mb:.1f} MB)  in {output_dir.name}')
 
 
+def write_all_series(slices, geom: 'OrientedCylinder', outputs,
+                     row_min, crop_h, col_min, crop_w,
+                     row_cos, col_cos, row_sp, col_sp,
+                     z_lo: int, z_hi: int):
+    """Write several DICOM series in ONE pass over the source slices.
+
+    `outputs` is a list of (kind, output_dir, bone_thresh_hu_or_None).
+
+    Writing each series separately re-reads every 2.8 MB source slice once per
+    series and deep-copies the full dataset per output file; for five series
+    that is ~6,000 reads and ~17 GB of redundant copying. Here each slice is
+    read once, the pixel data is detached so the per-output dataset copy is
+    headers-only, and all outputs are emitted together. Output bytes are
+    identical to write_series().
+    """
+    outputs = [(k, Path(d), thr) for k, d, thr in outputs]
+    for _, d, _ in outputs:
+        d.mkdir(parents=True, exist_ok=True)
+    n_active = {str(d): 0 for _, d, _ in outputs}
+
+    for i, (inst, path) in enumerate(slices):
+        ds  = pydicom.dcmread(str(path))
+        px  = ds.pixel_array
+        orig_dtype = px.dtype
+        src = px[row_min:row_min + crop_h, col_min:col_min + crop_w].astype(np.int32)
+
+        in_block = z_lo <= i <= z_hi
+        hu = None
+        if in_block and any(thr is not None for _, _, thr in outputs):
+            hu = pixel_to_hu(px, ds)[row_min:row_min + crop_h,
+                                     col_min:col_min + crop_w]
+
+        new_ipp = [f'{v:.6f}' for v in crop_ipp(
+            [float(v) for v in ds.ImagePositionPatient],
+            col_min, row_min, col_sp, row_sp, row_cos, col_cos)]
+
+        # Blank the bulk pixel data so per-output deepcopy is headers-only.
+        # Keep the element itself (ds.PixelData = b'') rather than deleting it:
+        # deletion discards the explicit VR and pydicom refuses to write the
+        # re-added element with ambiguous 'OB or OW'.
+        # (Also drop pydicom's cached decode, which deepcopy would duplicate.)
+        ds.PixelData = b''
+        ds._pixel_array = None
+        ds._pixel_id = {}
+        # Some exports carry Command Set (group 0000) elements, which are
+        # network-protocol artifacts pydicom refuses to write to file.
+        for tag in [t for t in ds.keys() if t.group == 0x0000]:
+            del ds[tag]
+
+        for kind, d, thr in outputs:
+            arr = src.copy()
+            if in_block:
+                m = geom.slice_mask(i, kind, row_min, crop_h, col_min, crop_w)
+                if thr is not None:
+                    m = m & (hu > thr)
+                arr[~m] = 0
+                if m.any():
+                    n_active[str(d)] += 1
+            else:
+                arr[:] = 0
+
+            ds_out         = copy.deepcopy(ds)
+            ds_out.Rows    = crop_h
+            ds_out.Columns = crop_w
+            ds_out.ImagePositionPatient = list(new_ipp)
+            ds_out.SOPInstanceUID = generate_uid()
+            ds_out.file_meta.MediaStorageSOPInstanceUID = ds_out.SOPInstanceUID
+            ds_out.PixelData     = arr.astype(orig_dtype).tobytes()
+            ds_out.BitsAllocated = orig_dtype.itemsize * 8
+            ds_out.BitsStored    = ds_out.BitsAllocated
+            ds_out.HighBit       = ds_out.BitsAllocated - 1
+            pydicom.dcmwrite(str(d / path.name), ds_out)
+
+        if (i + 1) % 300 == 0 or i + 1 == len(slices):
+            print(f'  Written {i+1}/{len(slices)} × {len(outputs)} series')
+
+    for kind, d, thr in outputs:
+        print(f'  → {d.name}: {n_active[str(d)]} non-empty slices')
+
+
 def write_axial_preview(slices, geom: 'OrientedCylinder', out_png: Path,
                         n_slices: int, orig_h: int, orig_w: int):
     """Reslice the CT PERPENDICULAR to the fitted axis and save a PNG.
@@ -553,6 +640,20 @@ def main():
                              'to correct — the ROI is deliberately not moved.')
     parser.add_argument('--no-axial-preview', action='store_true',
                         help='Skip the perpendicular-to-axis axial view PNG')
+    parser.add_argument('--fit-only', metavar='JSON',
+                        help='Stop after fitting: write centre/axis/spacing to '
+                             'this JSON and skip all series + preview. Use when '
+                             '4_propagate_roi.py will place and write the final '
+                             'series anyway — writing them here is wasted I/O.')
+    parser.add_argument('--fast-fit', action='store_true',
+                        help='Fit the cylinder from the mask at network resolution '
+                             'instead of upsampling every slice to full frame. '
+                             'Equivalent for PCA purposes; intended for fits that '
+                             'serve as registration hints.')
+    parser.add_argument('--batch-size', type=int, default=8,
+                        help='GPU batch size for the prediction pass (default 8)')
+    parser.add_argument('--io-threads', type=int, default=4,
+                        help='Reader threads feeding the GPU (default 4)')
     args = parser.parse_args()
 
     input_dir  = Path(args.input)
@@ -564,7 +665,10 @@ def main():
     if not model_path.exists():
         print(f'ERROR: model not found: {model_path}'); sys.exit(1)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not args.fit_only:
+        # Deferred in fit-only mode: an empty dir named like a real output
+        # series would masquerade as a completed segmentation.
+        output_dir.mkdir(parents=True, exist_ok=True)
     device = get_device()
     print(f'Device  : {device}')
     print(f'Input   : {input_dir}')
@@ -600,29 +704,36 @@ def main():
     print(f'Voxel spacing (Z,row,col): {spacing} mm')
 
     # ── Pass 1: predict, keeping only voxel COORDINATES (not the 1.7 GB volume) ──
-    print(f'\nPass 1 — predicting masks  (mode: {"2.5D + Z-pos" if in_ch == 7 else "2D"})...')
-    per_slice_coords = [None] * n     # index → (rows, cols) arrays
+    print(f'\nPass 1 — predicting masks  (mode: {"2.5D + Z-pos" if in_ch == 7 else "2D"}'
+          f'{", fast-fit" if args.fast_fit else ""}, batch {args.batch_size})...')
+    per_slice_coords = [None] * n     # index → (rows, cols) float arrays
 
     def _read_hu(path):
         ds = pydicom.dcmread(str(path))
         return normalize_hu(pixel_to_hu(ds.pixel_array, ds))
 
-    for i, (inst, path) in enumerate(slices):
-        img_n = _read_hu(path)
+    scale_r = orig_h / TARGET_SIZE
+    scale_c = orig_w / TARGET_SIZE
 
-        if in_ch == 7:
-            # Read neighbouring slices (re-use current at boundaries to avoid extra I/O)
-            img_prev = _read_hu(slices[max(0, i - 1)][1])
-            img_next = _read_hu(slices[min(n - 1, i + 1)][1])
-            z_pos    = i / max(n - 1, 1)
-            mask_small = predict_slice(model, img_n, device, args.threshold,
-                                       in_ch=in_ch, img_norm_prev=img_prev,
-                                       img_norm_next=img_next, z_pos=z_pos)
-        else:
-            mask_small = predict_slice(model, img_n, device, args.threshold, in_ch=in_ch)
-
-        full_mask  = upsample_mask(mask_small, orig_h, orig_w)
-        # Keep only the largest connected component; drop masks below min area
+    def _postproc(i, mask_small):
+        """Largest-CC filter + coordinate collection for one predicted mask."""
+        if args.fast_fit:
+            # Fit at network resolution: CC and coords at TARGET_SIZE, scaled to
+            # full-frame pixels. Sub-voxel identical for PCA purposes (the 0.47 mm
+            # grid quantisation averages out over ~10^5 points) and skips the
+            # expensive 1200² upsample + CC. Use only where the fit is a hint
+            # (e.g. before 4_propagate_roi.py) or after validating equivalence.
+            if not mask_small.any():
+                return
+            labeled, n_comps = cc_label(mask_small)
+            sizes = np.bincount(labeled.ravel())[1:]
+            if sizes.max() < args.min_blob_area / (scale_r * scale_c):
+                return
+            m = labeled == (sizes.argmax() + 1)
+            rr, cc = np.where(m)
+            per_slice_coords[i] = ((rr + 0.5) * scale_r, (cc + 0.5) * scale_c)
+            return
+        full_mask = upsample_mask(mask_small, orig_h, orig_w)
         if full_mask.any():
             labeled, n_comps = cc_label(full_mask)
             if n_comps > 0:
@@ -633,11 +744,54 @@ def main():
                     full_mask[:] = 0
         if full_mask.any():
             rr, cc = np.where(full_mask)
-            per_slice_coords[i] = (rr.astype(np.int32), cc.astype(np.int32))
+            per_slice_coords[i] = (rr.astype(np.float64), cc.astype(np.float64))
 
-        if (i + 1) % 100 == 0 or i + 1 == n:
-            n_act = sum(1 for k in range(i + 1) if per_slice_coords[k] is not None)
-            print(f'  {i+1}/{n}  active so far: {n_act}')
+    if in_ch == 2:
+        # Threaded read+preprocess feeding batched GPU inference.
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _prep(item):
+            i, path = item
+            img = _read_hu(path)
+            t = resize2d(img, TARGET_SIZE, order=1)
+            return i, np.stack([t, compute_otsu_map(t)], axis=0)
+
+        def _flush(buf):
+            inp = torch.from_numpy(np.stack([b[1] for b in buf])).to(device)
+            with torch.no_grad():
+                prob = torch.sigmoid(model(inp)).squeeze(1).cpu().numpy()
+            for (i, _), pr in zip(buf, prob):
+                _postproc(i, (pr > args.threshold).astype(np.uint8))
+
+        done = 0
+        buf = []
+        with ThreadPoolExecutor(max_workers=args.io_threads) as ex:
+            for rec in ex.map(_prep, [(i, p) for i, (inst, p) in enumerate(slices)],
+                              chunksize=4):
+                buf.append(rec)
+                if len(buf) == args.batch_size:
+                    _flush(buf); done += len(buf); buf = []
+                    if done % 300 < args.batch_size:
+                        n_act = sum(1 for c in per_slice_coords if c is not None)
+                        print(f'  {done}/{n}  active so far: {n_act}')
+        if buf:
+            _flush(buf)
+        print(f'  {n}/{n}  active: '
+              f'{sum(1 for c in per_slice_coords if c is not None)}')
+    else:
+        for i, (inst, path) in enumerate(slices):
+            img_n = _read_hu(path)
+            # Read neighbouring slices (re-use current at boundaries)
+            img_prev = _read_hu(slices[max(0, i - 1)][1])
+            img_next = _read_hu(slices[min(n - 1, i + 1)][1])
+            z_pos    = i / max(n - 1, 1)
+            mask_small = predict_slice(model, img_n, device, args.threshold,
+                                       in_ch=in_ch, img_norm_prev=img_prev,
+                                       img_norm_next=img_next, z_pos=z_pos)
+            _postproc(i, mask_small)
+            if (i + 1) % 100 == 0 or i + 1 == n:
+                n_act = sum(1 for k in range(i + 1) if per_slice_coords[k] is not None)
+                print(f'  {i+1}/{n}  active so far: {n_act}')
 
     active_z = np.array([i for i in range(n) if per_slice_coords[i] is not None])
 
@@ -673,8 +827,11 @@ def main():
     center_mm, axis, eigvals = fit_axis(coords_mm)
     center_vox = center_mm / spacing
 
+    eff_vox = (len(coords_mm) * scale_r * scale_c if args.fast_fit
+               else len(coords_mm))
     print(f'\n── Fitted cylinder ──────────────────────────────────────────')
-    print(f'  raw predicted voxels : {len(coords_mm):,}')
+    print(f'  raw predicted voxels : {eff_vox:,.0f}'
+          f'{"  (fast-fit, scaled from network grid)" if args.fast_fit else ""}')
     print(f'  center (Z,row,col)   : {np.round(center_vox, 1)} px   '
           f'{np.round(center_mm, 2)} mm')
     print(f'  axis   (Z,row,col)   : {np.round(axis, 4)}')
@@ -687,6 +844,18 @@ def main():
           f'ring {RING_INNER_MM}–{RING_OUTER_MM} mm')
 
     geom = OrientedCylinder(center_mm, axis, spacing)
+
+    if args.fit_only:
+        import json
+        fit = dict(center_mm=center_mm.tolist(), axis=axis.tolist(),
+                   spacing=spacing.tolist(), eigvals=eigvals.tolist(),
+                   n_slices=n, rows=int(orig_h), cols=int(orig_w),
+                   raw_voxels=float(eff_vox), fast_fit=bool(args.fast_fit),
+                   input=str(input_dir))
+        Path(args.fit_only).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.fit_only).write_text(json.dumps(fit, indent=1))
+        print(f'\n--fit-only: fit written to {args.fit_only}; no series written.')
+        return
 
     # ── Crop box + active Z range from the cylinder's own bounding box ───────
     half = geom.bbox_half_mm() + args.margin_mm
@@ -733,30 +902,22 @@ def main():
     cyl_dir   = output_dir.parent / (output_dir.name + '_cylinder')
     ring_dir  = output_dir.parent / (output_dir.name + '_ring')
 
-    write_kw = dict(row_min=row_min, crop_h=crop_h, col_min=col_min, crop_w=crop_w,
-                    row_cos=row_cos, col_cos=col_cos, row_sp=row_sp, col_sp=col_sp,
-                    z_lo=z_lo, z_hi=z_hi)
-
-    # ── Pass 2: write all three DICOM series ─────────────────────────────────
-    print('\nPass 2 — writing union (core ∪ ring) series...')
-    write_series(slices, geom, 'union', union_dir, **write_kw)
-
-    print(f'\nPass 3 — writing {2*CYLINDER_MM:.0f} mm core cylinder series...')
-    write_series(slices, geom, 'cylinder', cyl_dir, **write_kw)
-
-    print(f'\nPass 4 — writing {2*RING_OUTER_MM:.0f} mm reference ring series...')
-    write_series(slices, geom, 'ring', ring_dir, **write_kw)
-
+    # ── Pass 2: write ALL series in one sweep over the source slices ─────────
+    outputs = [('union', union_dir, None),
+               ('cylinder', cyl_dir, None),
+               ('ring', ring_dir, None)]
     if args.bone_refine:
         thr = args.bone_threshold
-        cyl_bone_dir  = output_dir.parent / (output_dir.name + '_cylinder_bone')
-        ring_bone_dir = output_dir.parent / (output_dir.name + '_ring_bone')
-        print(f'\nPass 5 — core cylinder, bone only (HU > {thr:.0f})...')
-        write_series(slices, geom, 'cylinder', cyl_bone_dir,
-                     bone_thresh_hu=thr, **write_kw)
-        print(f'\nPass 6 — reference ring, bone only (HU > {thr:.0f})...')
-        write_series(slices, geom, 'ring', ring_bone_dir,
-                     bone_thresh_hu=thr, **write_kw)
+        outputs += [
+            ('cylinder', output_dir.parent / (output_dir.name + '_cylinder_bone'), thr),
+            ('ring',     output_dir.parent / (output_dir.name + '_ring_bone'),     thr)]
+    print(f'\nPass 2 — writing {len(outputs)} DICOM series (single pass)...')
+    write_all_series(slices, geom, outputs,
+                     row_min=row_min, crop_h=crop_h, col_min=col_min, crop_w=crop_w,
+                     row_cos=row_cos, col_cos=col_cos, row_sp=row_sp, col_sp=col_sp,
+                     z_lo=z_lo, z_hi=z_hi)
+
+    if args.bone_refine:
         print(f'\n  BV/TV denominators are the matching all-tissue series. Note the '
               f'\n  {CYL_HEIGHT_MM:.0f} mm ROI height spans well beyond the calvarial plate '
               f'(~3.5-4 mm),\n  so absolute BV/TV is geometrically diluted and is NOT '
@@ -773,9 +934,13 @@ def main():
             print(f'  low-density centroid : ({off["du"]:+.2f}, {off["dv"]:+.2f}) mm '
                   f'from the ROI centre  → {off["dist"]:.2f} mm')
             print(f'  void fraction in ROI : {100*off["void_frac"]:.1f}%')
-            print('  The fitted centre reproduces the annotation protocol to 0.21 mm '
-                  '(GT-validated),\n  so this offset reflects remodelling away from the '
-                  'trephine site, not misplacement.')
+            print('  Interpret with care. On 3-month scans the fitted centre matches '
+                  'the annotation\n  protocol to 0.21 mm, so an offset there is real '
+                  'void asymmetry. On LATER\n  timepoints the network has a measured '
+                  '2-3 mm placement bias (it was trained\n  on 3-month appearance '
+                  'only), so this offset may be mostly placement error —\n  validate '
+                  'or fix the placement with 4_propagate_roi.py before reading this\n'
+                  '  number as biology.')
 
     if not args.no_axial_preview:
         print('\nRendering axial view (⟂ to fitted axis)...')
