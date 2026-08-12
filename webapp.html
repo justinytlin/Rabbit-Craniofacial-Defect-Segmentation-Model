@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Defect Segmentation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --ink: #1c2330; --muted: #66707f;
+    --line: #e3e6ea; --accent: #2563eb; --accent-ink: #ffffff;
+    --pass: #157347; --warn: #b45309; --fail: #b91c1c;
+    --chip: #eef2f7; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+         background: var(--bg); color: var(--ink); }
+  header { padding: 14px 22px; background: var(--card); border-bottom: 1px solid var(--line);
+           display: flex; align-items: baseline; gap: 12px; }
+  header h1 { font-size: 17px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12.5px; }
+  main { display: grid; grid-template-columns: 400px 1fr; gap: 18px; padding: 18px 22px;
+         max-width: 1500px; margin: 0 auto; align-items: start; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+             color: var(--muted); margin: 0 0 12px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  .pathrow { display: flex; gap: 6px; }
+  input[type=text], input[type=number] {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px;
+    font: 12.5px var(--mono); color: var(--ink); background: #fbfcfd; }
+  button { border: 1px solid var(--line); background: var(--card); color: var(--ink);
+           border-radius: 7px; padding: 7px 12px; font-size: 13px; cursor: pointer; }
+  button:hover { background: #f0f3f7; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent);
+                   font-weight: 600; width: 100%; padding: 10px; margin-top: 14px; }
+  button.primary:hover { filter: brightness(1.08); }
+  button.primary:disabled { opacity: .5; cursor: default; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { background: var(--chip); border-radius: 999px; padding: 3px 10px; font-size: 12px; }
+  .chip b { font-weight: 600; }
+  .modehelp { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .mode-warning { color: var(--warn); font-weight: 500; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 12px 0 0; padding: 4px 10px 10px; }
+  legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+  .radio { display: flex; gap: 8px; align-items: flex-start; margin: 8px 0; font-size: 13px; }
+  .radio input { margin-top: 3px; }
+  .inline { display: flex; gap: 14px; align-items: center; margin-top: 10px; font-size: 13px; }
+  .error { color: var(--fail); font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; }
+  /* jobs */
+  .job { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+         cursor: pointer; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+  .job:hover { background: #fafbfc; }
+  .job.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .job .name { font-weight: 600; font-size: 13px; }
+  .job .when { color: var(--muted); font-size: 11.5px; }
+  .status { font-size: 11px; font-weight: 700; border-radius: 999px; padding: 2px 9px;
+            text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+  .st-running { background: #dbeafe; color: #1d4ed8; }
+  .st-queued, .st-interrupted { background: var(--chip); color: var(--muted); }
+  .st-done { background: #d1fae5; color: var(--pass); }
+  .st-done_warn { background: #fef3c7; color: var(--warn); }
+  .st-done_fail, .st-failed { background: #fee2e2; color: var(--fail); }
+  .st-cancelled { background: var(--chip); color: var(--muted); }
+  /* detail */
+  .check { display: flex; gap: 9px; margin: 7px 0; font-size: 13px; }
+  .check .ico { font-weight: 800; width: 16px; text-align: center; }
+  .ck-pass .ico { color: var(--pass); } .ck-warn .ico { color: var(--warn); }
+  .ck-fail .ico { color: var(--fail); }
+  .check .d { color: var(--muted); font-size: 12.3px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+             gap: 8px; margin-top: 4px; }
+  .metric { background: var(--chip); border-radius: 8px; padding: 8px 10px; }
+  .metric .k { font-size: 11px; color: var(--muted); }
+  .metric .v { font: 600 14px var(--mono); }
+  table { border-collapse: collapse; width: 100%; margin-top: 6px; font-size: 12.5px; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; }
+  .hero { display: flex; gap: 10px; margin: 10px 0 4px; flex-wrap: wrap; }
+  .hero .metric { flex: 1; min-width: 150px; background: #eff6ff; }
+  .hero .metric .v { font-size: 20px; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  pre.log { background: #0f1620; color: #cdd6e4; border-radius: 8px; padding: 12px;
+            font: 11.5px/1.5 var(--mono); max-height: 420px; overflow: auto; white-space: pre-wrap; }
+  img.preview { max-width: 100%; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+  /* modal */
+  .overlay { position: fixed; inset: 0; background: rgba(15,22,32,.45); display: none;
+             align-items: center; justify-content: center; z-index: 10; }
+  .overlay.show { display: flex; }
+  .modal { background: var(--card); border-radius: 12px; width: min(720px, 92vw);
+           max-height: 82vh; display: flex; flex-direction: column; }
+  .modal header { border-radius: 12px 12px 0 0; }
+  .modal .path { font: 12px var(--mono); color: var(--muted); word-break: break-all; }
+  .modal .list { overflow: auto; padding: 6px 10px; }
+  .dirrow { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 7px;
+            cursor: pointer; }
+  .dirrow:hover { background: #f0f3f7; }
+  .dirrow .n { flex: 1; font-size: 13px; }
+  .badge { font-size: 10.5px; border-radius: 999px; padding: 2px 8px; background: var(--chip);
+           color: var(--muted); white-space: nowrap; }
+  .badge.dcm { background: #dbeafe; color: #1d4ed8; }
+  .badge.roi { background: #d1fae5; color: var(--pass); }
+  .badge.gt { background: #fde68a; color: #92400e; }
+  .modal footer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line);
+                  justify-content: flex-end; align-items: center; }
+  .modal footer .cur { flex: 1; font: 11.5px var(--mono); color: var(--muted); word-break: break-all; }
+  .empty { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rabbit Calvarial Defect Segmentation</h1>
+  <div class="sub">U-Net detection &middot; rigid ROI template &middot; registration placement for later timepoints</div>
+</header>
+
+<main>
+  <!-- ── new run ─────────────────────────────────────────── -->
+  <div class="card" id="formCard">
+    <h2>New segmentation run</h2>
+
+    <label>Scan to segment (DICOM folder)</label>
+    <div class="pathrow">
+      <input type="text" id="input" placeholder="…/GROUP/6 MONTH/37951/dicom_t58524">
+      <button onclick="openBrowser('input')">Browse</button>
+    </div>
+    <div class="chips" id="ctxChips"></div>
+
+    <fieldset>
+      <legend>ROI placement</legend>
+      <label class="radio"><input type="radio" name="mode" value="3m">
+        <span><b>3-month scan</b> — direct network placement<br>
+        <span class="modehelp">The training timepoint; placement accurate to ~0.2 mm on ground truth.</span></span></label>
+      <label class="radio"><input type="radio" name="mode" value="later_reg">
+        <span><b>Later timepoint</b> — registration from the 3-month ROI (recommended)<br>
+        <span class="modehelp">Runs detection, then places the ROI by skull-local registration.</span></span></label>
+      <label class="radio"><input type="radio" name="mode" value="later_raw">
+        <span><b>Later timepoint</b> — raw network placement<br>
+        <span class="modehelp mode-warning">Only if no 3-month scan exists: the network is 2–3 mm biased at later timepoints.</span></span></label>
+
+      <div id="refBlock" style="display:none">
+        <label>Reference 3-month scan (DICOM folder)</label>
+        <div class="pathrow">
+          <input type="text" id="ref_input">
+          <button onclick="openBrowser('ref_input')">Browse</button>
+        </div>
+        <label>Reference 3-month ROI (ground truth <code>*_output_dicom</code>, or a 3-month prediction)</label>
+        <div class="pathrow">
+          <input type="text" id="ref_roi">
+          <button onclick="openBrowser('ref_roi')">Browse</button>
+        </div>
+        <div class="inline"><label style="margin:0"><input type="checkbox" id="wide_search"> Wide rotation search (slower; use if dice comes back low)</label></div>
+      </div>
+    </fieldset>
+
+    <label>Output series name (written next to the scan)</label>
+    <input type="text" id="output">
+
+    <div class="inline">
+      <span>Bone threshold <input type="number" id="bone_threshold" value="226" style="width:80px"> HU</span>
+      <label style="margin:0"><input type="checkbox" id="overwrite"> Overwrite existing</label>
+    </div>
+    <div class="note">226 HU = ASBMR mineralised-bone convention. Fix one value for the whole
+      study and report it with every number; ratios at different thresholds are not comparable.</div>
+
+    <button class="primary" id="runBtn" onclick="startRun()">Run segmentation</button>
+    <div class="error" id="formError"></div>
+  </div>
+
+  <!-- ── jobs + detail ───────────────────────────────────── -->
+  <div>
+    <div class="card">
+      <h2>Runs</h2>
+      <div id="jobList"><div class="empty">No runs yet — pick a scan on the left.</div></div>
+    </div>
+    <div class="card" id="detailCard" style="display:none; margin-top:18px">
+      <h2 style="display:flex; justify-content:space-between">
+        <span id="dTitle"></span>
+        <button id="cancelBtn" style="display:none" onclick="cancelJob()">Cancel</button>
+      </h2>
+      <div id="dChecks"></div>
+      <div id="dResults"></div>
+      <div id="dPreview"></div>
+      <details style="margin-top:12px" open>
+        <summary style="cursor:pointer; color:var(--muted); font-size:12.5px">Console log</summary>
+        <pre class="log" id="dLog"></pre>
+      </details>
+    </div>
+  </div>
+</main>
+
+<!-- ── folder browser modal ──────────────────────────────── -->
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <header style="border-bottom:1px solid var(--line)">
+      <div>
+        <h1 style="font-size:14px" id="mTitle">Choose a folder</h1>
+        <div class="path" id="mPath"></div>
+      </div>
+    </header>
+    <div class="list" id="mList"></div>
+    <footer>
+      <div class="cur" id="mCur"></div>
+      <button onclick="browseUp()">Up</button>
+      <button onclick="closeBrowser()">Cancel</button>
+      <button class="primary" style="width:auto; margin:0" onclick="pickCurrent()">Select this folder</button>
+    </footer>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let DATA_ROOT = null, selectedJob = null, logLen = 0, browseTarget = null, browsePath = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+// ── init ────────────────────────────────────────────────────
+(async () => {
+  const cfg = await api('/api/config');
+  DATA_ROOT = cfg.data_root;
+  $('bone_threshold').value = cfg.bone_threshold;
+  refreshJobs();
+  setInterval(refreshJobs, 2500);
+  setInterval(pollDetail, 1800);
+})();
+
+document.querySelectorAll('input[name=mode]').forEach(r =>
+  r.addEventListener('change', () =>
+    $('refBlock').style.display = modeVal() === 'later_reg' ? '' : 'none'));
+const modeVal = () => (document.querySelector('input[name=mode]:checked') || {}).value;
+
+// ── context detection ───────────────────────────────────────
+$('input').addEventListener('change', suggest);
+async function suggest() {
+  const p = $('input').value.trim();
+  if (!p) return;
+  $('ctxChips').innerHTML = '';
+  try {
+    const s = await api('/api/suggest?input=' + encodeURIComponent(p));
+    const chips = [];
+    if (s.subject)   chips.push(`Subject <b>${s.subject}</b>`);
+    if (s.group)     chips.push(`Group <b>${s.group}</b>`);
+    if (s.timepoint) chips.push(`Timepoint <b>${s.timepoint}</b>`);
+    chips.push(`<b>${s.n_dcm}</b> DICOM slices`);
+    $('ctxChips').innerHTML = chips.map(c => `<span class="chip">${c}</span>`).join('');
+    if (s.suggested_output && !$('output').value) $('output').value = s.suggested_output;
+    if (s.is_3m === true) setMode('3m');
+    else if (s.is_3m === false) {
+      setMode('later_reg');
+      if (s.ref_input) $('ref_input').value = s.ref_input;
+      if (s.ref_roi)   $('ref_roi').value = s.ref_roi;
+      if (!s.ref_input || !s.ref_roi) {
+        $('ctxChips').innerHTML += '<span class="chip" style="background:#fef3c7">No 3-month reference found automatically — pick one, or fall back to raw placement.</span>';
+      }
+    }
+  } catch (e) { $('formError').textContent = e.message; }
+}
+function setMode(v) {
+  document.querySelector(`input[name=mode][value=${v}]`).checked = true;
+  $('refBlock').style.display = v === 'later_reg' ? '' : 'none';
+}
+
+// ── run ─────────────────────────────────────────────────────
+async function startRun() {
+  $('formError').textContent = '';
+  const mode = modeVal();
+  if (!mode) { $('formError').textContent = 'Choose a placement mode.'; return; }
+  if (mode === 'later_raw' &&
+      !confirm('Raw network placement on a non-3-month scan has a measured 2–3 mm bias. ' +
+               'The run will be flagged. Continue?')) return;
+  const body = {
+    mode,
+    input: $('input').value.trim(),
+    output: $('output').value.trim(),
+    ref_input: $('ref_input').value.trim() || null,
+    ref_roi: $('ref_roi').value.trim() || null,
+    bone_threshold: parseFloat($('bone_threshold').value),
+    wide_search: $('wide_search').checked,
+    overwrite: $('overwrite').checked,
+  };
+  $('runBtn').disabled = true;
+  try {
+    const r = await api('/api/run', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                     body: JSON.stringify(body)});
+    selectJob(r.id);
+    refreshJobs();
+  } catch (e) { $('formError').textContent = e.message; }
+  $('runBtn').disabled = false;
+}
+
+// ── job list ────────────────────────────────────────────────
+const STATUS_LABEL = {queued: 'queued', running: 'running', done: 'passed',
+  done_warn: 'check warnings', done_fail: 'failed checks', failed: 'error',
+  cancelled: 'cancelled', interrupted: 'interrupted'};
+async function refreshJobs() {
+  const j = await api('/api/jobs');
+  const el = $('jobList');
+  if (!j.jobs.length) return;
+  el.innerHTML = j.jobs.map(job => `
+    <div class="job ${job.id === selectedJob ? 'sel' : ''}" onclick="selectJob('${job.id}')">
+      <div><div class="name">${job.label}</div>
+        <div class="when">${new Date(job.created * 1000).toLocaleString()} &middot; ${modeName(job.mode)}</div></div>
+      <span class="status st-${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
+    </div>`).join('');
+}
+const modeName = m => ({'3m': '3-month, network placement',
+  later_reg: 'registration placement', later_raw: 'RAW network placement'}[m] || m);
+
+function selectJob(id) {
+  selectedJob = id; logLen = 0;
+  $('detailCard').style.display = '';
+  $('dLog').textContent = '';
+  pollDetail(true);
+  refreshJobs();
+}
+
+async function pollDetail(force) {
+  if (!selectedJob) return;
+  const j = await api(`/api/jobs/${selectedJob}?log_from=${logLen}`);
+  if (j.log) {
+    const atEnd = $('dLog').scrollTop + $('dLog').clientHeight >= $('dLog').scrollHeight - 40;
+    $('dLog').textContent += j.log;
+    logLen = j.log_len;
+    if (atEnd) $('dLog').scrollTop = $('dLog').scrollHeight;
+  }
+  $('dTitle').textContent = `${j.label} — ${STATUS_LABEL[j.status] || j.status}`;
+  $('cancelBtn').style.display = (j.status === 'running' || j.status === 'queued') ? '' : 'none';
+  renderChecks(j); renderResults(j); renderPreview(j);
+}
+
+async function cancelJob() {
+  if (selectedJob) await api(`/api/jobs/${selectedJob}/cancel`, {method: 'POST'});
+}
+
+// ── detail rendering ────────────────────────────────────────
+// Re-render a section only when its data changed, so polling doesn't
+// re-create DOM (and re-fetch the preview image) every couple of seconds.
+const rendered = {};
+function changed(key, data) {
+  const s = JSON.stringify(data) + '|' + selectedJob;
+  if (rendered[key] === s) return false;
+  rendered[key] = s;
+  return true;
+}
+const ICO = {pass: '✓', warn: '⚠', fail: '✕'};
+function renderChecks(j) {
+  if (!changed('checks', j.checks)) return;
+  const el = $('dChecks');
+  if (!j.checks || !j.checks.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<h2 style="margin-top:14px">Sanity checks</h2>' + j.checks.map(c => `
+    <div class="check ck-${c.status}"><span class="ico">${ICO[c.status]}</span>
+      <span><b>${c.name}</b> — <span class="d">${c.detail}</span></span></div>`).join('');
+}
+
+function renderResults(j) {
+  if (!changed('results', [j.results, j.metrics])) return;
+  const el = $('dResults'), r = j.results, m = j.metrics || {};
+  let html = '';
+  const met = [];
+  if (m.tilt_deg != null)   met.push(['Axis tilt', m.tilt_deg.toFixed(1) + '°']);
+  if (m.eigenvalues)        met.push(['Eigenvalues mm²', m.eigenvalues.map(e => e.toFixed(1)).join(', ')]);
+  if (m.dice != null)       met.push(['Registration dice', m.dice.toFixed(3)]);
+  if (m.active_slices)      met.push(['Active slices', m.active_slices]);
+  if (m.roi_enclosed_pct != null) met.push(['Template enclosed', m.roi_enclosed_pct.toFixed(1) + '%']);
+  if (m.void_offset_mm != null) met.push(['Void offset', m.void_offset_mm.toFixed(2) + ' mm']);
+  if (met.length)
+    html += '<h2 style="margin-top:14px">Fit</h2><div class="metrics">' +
+      met.map(([k, v]) => `<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('') + '</div>';
+
+  if (r && r.series && Object.keys(r.series).length) {
+    if (r.core_to_ring != null) {
+      html += `<div class="hero">
+        <div class="metric"><div class="k">Core : ring BV/TV ratio &middot; ${r.bone_threshold} HU</div>
+          <div class="v">${r.core_to_ring}×</div></div>
+        <div class="metric"><div class="k">Core BV/TV</div><div class="v">${(100 * r.bvtv_core).toFixed(1)}%</div></div>
+        <div class="metric"><div class="k">Ring BV/TV</div><div class="v">${(100 * r.bvtv_ring).toFixed(1)}%</div></div>
+      </div>`;
+    }
+    html += '<table><tr><th>Series</th><th>Voxels</th><th>Volume mm³</th></tr>' +
+      Object.entries(r.series).map(([k, s]) =>
+        `<tr><td>${k}</td><td>${s.voxels.toLocaleString()}</td><td>${s.volume_mm3.toLocaleString()}</td></tr>`).join('') +
+      '</table>';
+    html += `<div class="note">Absolute BV/TV is diluted by the 8 mm ROI height (plate is ~3.5–4 mm)
+      and is <b>not comparable to published BV/TV</b> — report the core-to-ring ratio, with the
+      threshold (${r.bone_threshold} HU) and ROI height stated. Do not compare ratios across thresholds,
+      or between network-placed and registration-placed ROIs.</div>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderPreview(j) {
+  if (!changed('preview', j.preview)) return;
+  $('dPreview').innerHTML = j.preview
+    ? `<h2 style="margin-top:14px">Axial view (⊥ to fitted axis)</h2>
+       <img class="preview" src="/api/image?path=${encodeURIComponent(j.preview)}">`
+    : '';
+}
+
+// ── folder browser ──────────────────────────────────────────
+async function openBrowser(target) {
+  browseTarget = target;
+  $('mTitle').textContent = {input: 'Choose the scan folder',
+    ref_input: 'Choose the reference 3-month scan folder',
+    ref_roi: 'Choose the reference 3-month ROI folder'}[target] || 'Choose a folder';
+  const start = $(target).value.trim();
+  $('overlay').classList.add('show');
+  await browseTo(start || DATA_ROOT);
+}
+function closeBrowser() { $('overlay').classList.remove('show'); }
+async function browseTo(path) {
+  try {
+    const b = await api('/api/browse?path=' + encodeURIComponent(path));
+    browsePath = b.path;
+    $('mPath').textContent = b.path;
+    $('mCur').textContent = b.path;
+    $('mList').innerHTML = b.dirs.length ? b.dirs.map(d => {
+      const badges = [];
+      if (d.n_dcm) badges.push(`<span class="badge dcm">${d.n_dcm >= 1500 ? '1500+' : d.n_dcm} .dcm</span>`);
+      if (d.is_gt) badges.push('<span class="badge gt">ground truth</span>');
+      else if (d.is_roi) badges.push('<span class="badge roi">ROI series</span>');
+      return `<div class="dirrow" ondblclick="pickDir('${esc(d.path)}')" onclick="browseTo('${esc(d.path)}')">
+        <span class="n">📁 ${d.name}</span>${badges.join(' ')}</div>`;
+    }).join('') : '<div class="empty">No subfolders</div>';
+    $('mList').dataset.parent = b.parent || '';
+  } catch (e) { $('mList').innerHTML = `<div class="empty">${e.message}</div>`; }
+}
+function browseUp() { const p = $('mList').dataset.parent; if (p) browseTo(p); }
+function pickCurrent() { pickDir(browsePath); }
+function pickDir(path) {
+  $(browseTarget).value = path.replace(/\\'/g, "'");
+  closeBrowser();
+  if (browseTarget === 'input') suggest();
+}
+const esc = s => s.replace(/'/g, "\\'");
+</script>
+</body>
+</html>

@@ -40,6 +40,35 @@ identical rigid template of ~1,432,500 voxels:
 | Gap (excluded) | 5.0 < r < 7.0 mm |
 | Reference ring | 7.0 ≤ r ≤ 9.0 mm (14 mm ID / 18 mm OD) |
 
+## Lab web app — the easy way to run this
+
+> New lab members: read **`LAB_GUIDE.md`** — a step-by-step walkthrough of the app.
+
+For routine use, nobody needs the command line. Double-click
+**`Launch Defect Segmenter.command`** (or run `python3 webapp.py --open`) and a
+browser page opens at `http://127.0.0.1:8765`:
+
+- **Pick the scan folder** — the app recognises the study layout
+  (`GROUP/N MONTH/SUBJECT/dicom_t*`), fills in subject / group / timepoint, and
+  suggests an output name following the existing convention.
+- **Placement mode is chosen for you.** 3-month scans run direct network
+  placement; any other timepoint defaults to registration from the animal's
+  3-month ROI (`4_propagate_roi.py`), with the reference scan and ground-truth
+  ROI found automatically. Raw network placement at later timepoints requires
+  an explicit confirmation and is flagged in the results.
+- **Every run is sanity-checked automatically** against the ground-truth
+  envelope from this README: axis tilt 74–88°, eigenvalues near
+  (5.33, 20.98, 20.99) mm², full template enclosure, registration dice. Green
+  means trust it; red means discard it.
+- **Results on screen**: ROI volumes, core/ring BV/TV at the chosen threshold,
+  the core-to-ring ratio (the number to report), and the axial preview.
+- Hand-labeled ground-truth series (`<id>_output_dicom`) can never be
+  overwritten — the app refuses that output name outright.
+
+Run history and logs persist in `logs/webapp/`. To let other lab machines use
+one shared instance, start it with `python3 webapp.py --host 0.0.0.0` and open
+`http://<that-machine>:8765` — keep that to the lab network.
+
 ## Install
 
 ```bash
@@ -329,6 +358,8 @@ to train the 2.5D variant from scratch.
 2_train.py               train the U-Net
 3_inference.py           predict + stamp the ROI template → DICOM series
 4_propagate_roi.py       place later-timepoint ROIs by registration (use it!)
+webapp.py + webapp.html  local web app wrapping 3 & 4 for lab use
+Launch Defect Segmenter.command   double-click launcher for the web app
 model.py                 U-Net, Dice / focal / combined losses
 axial_view.py            reslice perpendicular to the fitted defect axis
 visualize_output.ipynb   inspect outputs, ROI volumes, BV/TV
