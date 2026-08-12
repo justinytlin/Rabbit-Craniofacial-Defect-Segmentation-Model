@@ -53,10 +53,19 @@ SERIES_SUFFIXES = ['', '_cylinder', '_ring', '_cylinder_bone', '_ring_bone']
 
 ALLOWED_ROOTS = [DATA_ROOT]
 
+UPLOADS_DIR = APP_DIR / 'uploads'
+INDEX_FILE = APP_DIR / 'scan_index.json'
+
 JOBS = {}          # id -> job dict
 JOB_LOCK = threading.Lock()
 JOB_QUEUE = queue.Queue()
 CURRENT_PROC = {}  # job_id -> subprocess.Popen
+
+# StudyID ('t57860') -> path of the raw scan directory in the study archive.
+# Lets an upload be recognised from its first file: known scans skip the
+# multi-GB upload entirely and reuse the copy already on the volume.
+SCAN_INDEX = {}
+INDEX_STATE = {'status': 'building'}
 
 
 # ─────────────────────────────────────────────────────────────── path helpers
@@ -74,7 +83,8 @@ def count_dcm(d: Path, cap: int = 5000) -> int:
     try:
         with os.scandir(d) as it:
             for e in it:
-                if e.name.lower().endswith('.dcm'):
+                # skip AppleDouble ('._*') and other hidden files
+                if e.name.lower().endswith('.dcm') and not e.name.startswith('.'):
                     n += 1
                     if n >= cap:
                         break
@@ -92,6 +102,66 @@ def is_roi_series_name(name: str) -> bool:
 def is_ground_truth_name(name: str) -> bool:
     """The 12 hand-labeled GT series are named exactly <digits>_output_dicom."""
     return re.fullmatch(r'\d+_output_dicom', name) is not None
+
+
+# ─────────────────────────────────────────────────────────────── scan index
+
+def read_study_id(dcm_path: Path):
+    try:
+        import pydicom
+        ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=True)
+        sid = str(getattr(ds, 'StudyID', '') or '').strip()
+        return sid or None
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def first_dcm(d: Path):
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if e.name.lower().endswith('.dcm') and not e.name.startswith('.'):
+                    return Path(e.path)
+    except OSError:
+        pass
+    return None
+
+
+def build_scan_index():
+    """Map every raw scan directory in the archive by its DICOM StudyID."""
+    try:
+        if INDEX_FILE.exists():
+            cached = json.loads(INDEX_FILE.read_text())
+            SCAN_INDEX.update({k: v for k, v in cached.items()
+                               if Path(v).is_dir()})
+            INDEX_STATE['status'] = 'ready'
+        fresh = {}
+        for dirpath, dirnames, filenames in os.walk(DATA_ROOT):
+            rel_depth = len(Path(dirpath).parts) - len(DATA_ROOT.parts)
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')
+                           and d != 'defect_segmentation'
+                           and 'output_dicom' not in d]
+            if rel_depth >= 5:
+                dirnames[:] = []
+            d = Path(dirpath)
+            n = sum(1 for f in filenames if f.lower().endswith('.dcm'))
+            if n < 500 or 'output_dicom' in d.name:
+                continue
+            f = first_dcm(d)
+            sid = read_study_id(f) if f else None
+            if not sid:
+                continue
+            # Prefer canonical dicom_t* dirs over duplicate exports.
+            if sid not in fresh or d.name.startswith('dicom'):
+                fresh[sid] = str(d)
+        SCAN_INDEX.clear()
+        SCAN_INDEX.update(fresh)
+        INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INDEX_FILE.write_text(json.dumps(fresh, indent=1))
+        INDEX_STATE['status'] = 'ready'
+        print(f'Scan index: {len(fresh)} scans')
+    except Exception as e:                              # noqa: BLE001
+        INDEX_STATE['status'] = f'error: {e}'
 
 
 # ───────────────────────────────────────────────────────── subject detection
@@ -170,6 +240,19 @@ def detect_context(input_dir: Path) -> dict:
                     info['ref_input'] = str((pref or dicoms)[0])
                 break
     return info
+
+
+def auto_version_output(base: Path) -> Path:
+    """Return base, or base_v2/_v3… if any series of base already exists."""
+    def taken(p: Path):
+        return any((p.parent / (p.name + s)).exists() for s in SERIES_SUFFIXES)
+    if not taken(base):
+        return base
+    for i in range(2, 100):
+        cand = base.parent / f'{base.name}_v{i}'
+        if not taken(cand):
+            return cand
+    raise RuntimeError('ran out of _v suffixes')
 
 
 # ──────────────────────────────────────────────────────────── job execution
@@ -326,7 +409,7 @@ def parse_metrics(log: str) -> dict:
             m['eigenvalues'] = [float(x) for x in eig.group(1).split()]
         except ValueError:
             pass
-    roi = re.search(r'ROI check\s*:\s*([\d.]+) / ([\d.]+) mm³ enclosed '
+    roi = re.search(r'ROI check\s*:\s*([\d.]+) / ([\d.]+) mm³ (?:enclosed )?'
                     r'\(([\d.]+)% of the template\)', log)
     if roi:
         m['roi_enclosed_pct'] = float(roi.group(3))
@@ -345,16 +428,33 @@ def compute_results(output_base: Path, bone_threshold: float) -> dict:
     """Voxel-count each written series with pydicom -> volumes, BV/TV, ratio."""
     import numpy as np
     import pydicom
+    from pydicom.uid import ImplicitVRLittleEndian
+
+    def read_ds(path):
+        # 4_propagate_roi.py writes series without the DICM preamble/file
+        # meta; force-read those and default the transfer syntax so
+        # pixel_array still decodes.
+        try:
+            ds = pydicom.dcmread(str(path))
+        except pydicom.errors.InvalidDicomError:
+            ds = pydicom.dcmread(str(path), force=True)
+        if not getattr(ds, 'file_meta', None) or \
+                not getattr(ds.file_meta, 'TransferSyntaxUID', None):
+            from pydicom.dataset import FileMetaDataset
+            ds.file_meta = getattr(ds, 'file_meta', None) or FileMetaDataset()
+            ds.file_meta.TransferSyntaxUID = ImplicitVRLittleEndian
+        return ds
 
     def series_stats(d: Path):
-        files = sorted(f for f in os.listdir(d) if f.lower().endswith('.dcm'))
+        files = sorted(f for f in os.listdir(d)
+                       if f.lower().endswith('.dcm') and not f.startswith('.'))
         if not files:
             return None
         vox = 0
         spacing = None
         z_positions = []
         for f in files:
-            ds = pydicom.dcmread(str(d / f))
+            ds = read_ds(d / f)
             arr = ds.pixel_array
             vox += int(np.count_nonzero(arr))
             if spacing is None:
@@ -407,6 +507,12 @@ def build_checks(job) -> list:
         add('Placement method', 'pass',
             'Registration from the 3-month reference ROI — the validated '
             'workflow for non-3-month scans.')
+    elif 'new scan' in (job.get('placement_note') or ''):
+        add('Placement method', 'warn',
+            'Network placement on a scan the app could not match to the study '
+            'archive, so the timepoint is unknown. Placement is accurate for '
+            '3-month scans; at later timepoints the network has a measured '
+            '2–3 mm bias — place by registration before quoting numbers.')
     else:
         add('Placement method', 'warn',
             'RAW network placement on a non-3-month scan. The network has a '
@@ -418,6 +524,18 @@ def build_checks(job) -> list:
         return checks
 
     tilt = m.get('tilt_deg')
+    if job['mode'] == 'later_reg':
+        # In a registration job the parsed tilt/eigenvalues describe the
+        # network's detection hint on an out-of-distribution timepoint — the
+        # final ROI's orientation comes from the reference via registration,
+        # and the head sits differently between sessions, so the 3-month GT
+        # envelope does not apply. Validity here = dice + enclosure.
+        if tilt is not None:
+            add('Detection hint', 'pass',
+                f'Network hint fit at {tilt:.1f}° tilt — used only to '
+                'initialise registration; final placement comes from the '
+                '3-month reference.')
+        tilt = None
     if tilt is not None:
         lo, hi = TILT_RANGE
         if lo <= tilt <= hi:
@@ -431,6 +549,8 @@ def build_checks(job) -> list:
                 f'{tilt:.1f}° — outside the GT range {lo}–{hi}°. Inspect the axial preview.')
 
     eig = m.get('eigenvalues')
+    if job['mode'] == 'later_reg':
+        eig = None                       # hint-fit values; see tilt note above
     if eig and len(eig) == 3:
         # Judge the smallest (axis, GT 5.33 mm²) and largest (transverse, GT
         # ~21 mm²) eigenvalues only: raw network masks are always elongated
@@ -521,7 +641,57 @@ class Handler(BaseHTTPRequestHandler):
 
         elif route == '/api/config':
             self._json({'data_root': str(DATA_ROOT),
-                        'bone_threshold': DEFAULT_BONE_THRESHOLD})
+                        'bone_threshold': DEFAULT_BONE_THRESHOLD,
+                        'index': INDEX_STATE['status'],
+                        'indexed_scans': len(SCAN_INDEX)})
+
+        elif route.startswith('/api/upload/') and route.endswith('/probe'):
+            uid = route.split('/')[3]
+            scan_dir = UPLOADS_DIR / uid / 'scan'
+            f = first_dcm(scan_dir) if scan_dir.is_dir() else None
+            if f is None:
+                return self._err('no uploaded .dcm file to probe yet')
+            sid = read_study_id(f)
+            known = SCAN_INDEX.get(sid) if sid else None
+            resp = {'study_id': sid, 'known': bool(known),
+                    'index': INDEX_STATE['status']}
+            if known:
+                resp['scan_path'] = known
+                ctx = detect_context(Path(known))
+                resp['context'] = {k: ctx.get(k) for k in
+                                   ('subject', 'group', 'timepoint', 'is_3m')}
+            self._json(resp)
+
+        elif route.startswith('/api/jobs/') and route.endswith('/download'):
+            jid = route.split('/')[3]
+            job = JOBS.get(jid)
+            if not job:
+                return self._err('no such job', 404)
+            out = Path(job['params']['output'])
+            zpath = APP_DIR / 'zips' / f'{jid}.zip'
+            if not zpath.exists():
+                import zipfile
+                zpath.parent.mkdir(parents=True, exist_ok=True)
+                tmp = zpath.with_suffix('.part')
+                with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
+                    for suf in SERIES_SUFFIXES:
+                        d = out.parent / (out.name + suf)
+                        if d.is_dir():
+                            for f in sorted(os.listdir(d)):
+                                if not f.startswith('.'):
+                                    z.write(d / f, f'{d.name}/{f}')
+                    png = out.parent / (out.name + '_axial_view.png')
+                    if png.exists():
+                        z.write(png, png.name)
+                tmp.rename(zpath)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Disposition',
+                             f'attachment; filename="{out.name}.zip"')
+            self.send_header('Content-Length', str(zpath.stat().st_size))
+            self.end_headers()
+            with open(zpath, 'rb') as fh:
+                shutil.copyfileobj(fh, self.wfile)
 
         elif route == '/api/browse':
             p = Path(q.get('path') or DATA_ROOT)
@@ -600,6 +770,24 @@ class Handler(BaseHTTPRequestHandler):
         if route == '/api/run':
             return self._start_job(payload)
 
+        if route == '/api/upload/start':
+            uid = uuid.uuid4().hex[:12]
+            (UPLOADS_DIR / uid / 'scan').mkdir(parents=True, exist_ok=True)
+            meta = {'folder': str(payload.get('folder') or 'uploaded scan'),
+                    'n_files': int(payload.get('n_files') or 0)}
+            (UPLOADS_DIR / uid / 'meta.json').write_text(json.dumps(meta))
+            return self._json({'upload_id': uid})
+
+        if route == '/api/autorun':
+            return self._autorun(payload)
+
+        if route.startswith('/api/upload/') and route.endswith('/discard'):
+            uid = route.split('/')[3]
+            d = UPLOADS_DIR / uid
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+            return self._json({'ok': True})
+
         if route.startswith('/api/jobs/') and route.endswith('/cancel'):
             jid = route.split('/')[3]
             job = JOBS.get(jid)
@@ -613,6 +801,110 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'ok': True})
 
         self._err('unknown route', 404)
+
+    def do_PUT(self):                                    # noqa: N802
+        url = urllib.parse.urlparse(self.path)
+        parts = url.path.split('/')
+        if len(parts) != 5 or parts[1:3] != ['api', 'upload'] or parts[4] != 'file':
+            return self._err('unknown route', 404)
+        uid = parts[3]
+        scan_dir = UPLOADS_DIR / uid / 'scan'
+        if not scan_dir.is_dir():
+            return self._err('unknown upload id', 404)
+        q = dict(urllib.parse.parse_qsl(url.query))
+        name = Path(q.get('name', '')).name          # strip any path components
+        if not name.lower().endswith('.dcm'):
+            return self._err('only .dcm files are accepted')
+        length = int(self.headers.get('Content-Length', 0))
+        if length <= 0 or length > 64 * 1024 * 1024:
+            return self._err('bad file size')
+        remaining = length
+        with open(scan_dir / name, 'wb') as fh:
+            while remaining:
+                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    return self._err('truncated upload')
+                fh.write(chunk)
+                remaining -= len(chunk)
+        self._json({'ok': True})
+
+    def _autorun(self, p):
+        """One-click flow: given an upload (or a scan path), decide the
+        placement mode, reference, and output automatically and queue the job."""
+        label_hint = None
+        if p.get('upload_id'):
+            uid = str(p['upload_id'])
+            updir = UPLOADS_DIR / uid
+            scan_dir = updir / 'scan'
+            if not scan_dir.is_dir() or count_dcm(scan_dir, cap=10) == 0:
+                return self._err('upload contains no .dcm files')
+            try:
+                meta = json.loads((updir / 'meta.json').read_text())
+                label_hint = meta.get('folder')
+            except (OSError, json.JSONDecodeError):
+                pass
+            sid = read_study_id(first_dcm(scan_dir))
+            known = SCAN_INDEX.get(sid) if sid else None
+            if known and Path(known).is_dir():
+                input_dir = Path(known)                  # reuse archive copy
+                shutil.rmtree(updir, ignore_errors=True)
+                placement_note = 'recognised as an archived study scan'
+            else:
+                input_dir = scan_dir
+                placement_note = 'new scan (not in the study archive)'
+        elif p.get('input'):
+            input_dir = Path(p['input'])
+            if not input_dir.is_dir() or count_dcm(input_dir, cap=10) == 0:
+                return self._err('input directory does not exist or has no .dcm files')
+            if not path_allowed(input_dir):
+                return self._err('input is outside the allowed data root')
+            placement_note = 'selected from disk'
+        else:
+            return self._err('give upload_id or input')
+
+        ctx = detect_context(input_dir)
+        in_uploads = UPLOADS_DIR in input_dir.parents
+        if in_uploads:
+            # Unknown uploaded scan: outputs live in the upload folder, the
+            # timepoint is unknown, and no reference can be located.
+            mode = 'later_raw'
+            sid = read_study_id(first_dcm(input_dir))
+            base = f'{sid or "scan"}_output_dicom_pred'
+            output = input_dir.parent / base
+            label = label_hint or base
+        else:
+            if ctx['is_3m']:
+                mode = '3m'
+            elif ctx['ref_input'] and ctx['ref_roi']:
+                mode = 'later_reg'
+            else:
+                mode = 'later_raw'
+            output = auto_version_output(Path(ctx['suggested_output']))
+            label = output.name
+
+        jid = uuid.uuid4().hex[:12]
+        job = {'id': jid, 'created': time.time(), 'status': 'queued',
+               'mode': mode, 'label': label,
+               'auto': True, 'placement_note': placement_note,
+               'context': {k: ctx.get(k) for k in ('subject', 'group', 'timepoint')},
+               'params': {'input': str(input_dir), 'output': str(output),
+                          'ref_input': ctx.get('ref_input'),
+                          'ref_roi': ctx.get('ref_roi'),
+                          'bone_threshold': DEFAULT_BONE_THRESHOLD,
+                          'wide_search': False, 'overwrite': False}}
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        job_log_path(jid).write_text(
+            f'Auto run — {placement_note}\n'
+            f'  scan      : {input_dir}\n'
+            f'  placement : {mode}\n'
+            f'  output    : {output}\n')
+        with JOB_LOCK:
+            JOBS[jid] = job
+        save_jobs()
+        JOB_QUEUE.put(jid)
+        self._json({'id': jid, 'mode': mode, 'label': label,
+                    'context': job['context'],
+                    'placement_note': placement_note})
 
     def _start_job(self, p):
         mode = p.get('mode')
@@ -695,6 +987,7 @@ def main():
     APP_DIR.mkdir(parents=True, exist_ok=True)
     load_jobs()
     threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=build_scan_index, daemon=True).start()
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f'http://{"127.0.0.1" if args.host == "0.0.0.0" else args.host}:{args.port}'

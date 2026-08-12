@@ -48,6 +48,19 @@
   .radio input { margin-top: 3px; }
   .inline { display: flex; gap: 14px; align-items: center; margin-top: 10px; font-size: 13px; }
   .error { color: var(--fail); font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; }
+  /* drop zone */
+  .drop { border: 2px dashed #b9c4d4; border-radius: 12px; padding: 34px 18px;
+          text-align: center; cursor: pointer; transition: all .15s; background: #fbfcfe; }
+  .drop:hover, .drop.over { border-color: var(--accent); background: #eff6ff; }
+  .drop .big { font-size: 15px; font-weight: 600; }
+  .drop .small { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  .drop .icon { font-size: 30px; margin-bottom: 8px; }
+  .progress { margin-top: 12px; display: none; }
+  .progress .bar { height: 8px; border-radius: 999px; background: var(--chip); overflow: hidden; }
+  .progress .fill { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .progress .txt { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  details.adv { margin-top: 14px; }
+  details.adv > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   /* jobs */
   .job { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
          cursor: pointer; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
@@ -118,7 +131,24 @@
 <main>
   <!-- ── new run ─────────────────────────────────────────── -->
   <div class="card" id="formCard">
-    <h2>New segmentation run</h2>
+    <h2>Segment a scan</h2>
+
+    <div class="drop" id="drop" onclick="document.getElementById('filepick').click()">
+      <div class="icon">🩻</div>
+      <div class="big">Drop a scan folder here</div>
+      <div class="small">or click to choose the folder of .dcm slices.<br>
+        The app identifies the animal &amp; timepoint automatically and picks the
+        right placement method — nothing else to fill in.</div>
+    </div>
+    <input type="file" id="filepick" webkitdirectory multiple style="display:none">
+    <div class="progress" id="progress">
+      <div class="bar"><div class="fill" id="progFill"></div></div>
+      <div class="txt" id="progTxt"></div>
+    </div>
+    <div class="error" id="dropError"></div>
+
+    <details class="adv">
+    <summary>Advanced — manual run (choose placement, reference, threshold)</summary>
 
     <label>Scan to segment (DICOM folder)</label>
     <div class="pathrow">
@@ -166,19 +196,24 @@
 
     <button class="primary" id="runBtn" onclick="startRun()">Run segmentation</button>
     <div class="error" id="formError"></div>
+    </details>
   </div>
 
   <!-- ── jobs + detail ───────────────────────────────────── -->
   <div>
     <div class="card">
       <h2>Runs</h2>
-      <div id="jobList"><div class="empty">No runs yet — pick a scan on the left.</div></div>
+      <div id="jobList"><div class="empty">No runs yet — drop a scan folder on the left to start.</div></div>
     </div>
     <div class="card" id="detailCard" style="display:none; margin-top:18px">
-      <h2 style="display:flex; justify-content:space-between">
+      <h2 style="display:flex; justify-content:space-between; gap:8px">
         <span id="dTitle"></span>
-        <button id="cancelBtn" style="display:none" onclick="cancelJob()">Cancel</button>
+        <span>
+          <a id="dlBtn" style="display:none" href="#"><button>Download results</button></a>
+          <button id="cancelBtn" style="display:none" onclick="cancelJob()">Cancel</button>
+        </span>
       </h2>
+      <div class="chips" id="dContext"></div>
       <div id="dChecks"></div>
       <div id="dResults"></div>
       <div id="dPreview"></div>
@@ -229,6 +264,103 @@ async function api(path, opts) {
   setInterval(refreshJobs, 2500);
   setInterval(pollDetail, 1800);
 })();
+
+// ── one-click upload & auto-run ─────────────────────────────
+const drop = $('drop');
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', async e => {
+  e.preventDefault(); drop.classList.remove('over');
+  const files = await gatherDropped(e.dataTransfer);
+  handleScanFiles(files);
+});
+$('filepick').addEventListener('change', e =>
+  handleScanFiles([...e.target.files].map(f => ({file: f, rel: f.webkitRelativePath || f.name}))));
+
+// Recursively collect files (with relative paths) from a dropped folder.
+async function gatherDropped(dt) {
+  const out = [];
+  const walk = (entry, prefix) => new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(f => { out.push({file: f, rel: prefix + f.name}); resolve(); }, resolve);
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const readAll = () => reader.readEntries(async entries => {
+        if (!entries.length) return resolve();
+        for (const en of entries) await walk(en, prefix + entry.name + '/');
+        readAll();                       // readEntries returns ≤100 at a time
+      }, resolve);
+      readAll();
+    } else resolve();
+  });
+  const items = [...dt.items].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  for (const e of items) await walk(e, '');
+  if (!out.length) [...dt.files].forEach(f => out.push({file: f, rel: f.name}));
+  return out;
+}
+
+async function handleScanFiles(all) {
+  $('dropError').textContent = '';
+  // Keep only .dcm files, then use the sub-folder containing the most slices —
+  // so dropping a whole subject folder still picks the raw scan, not the ROI.
+  const dcm = all.filter(x => x.file.name.toLowerCase().endsWith('.dcm'));
+  if (!dcm.length) { $('dropError').textContent = 'No .dcm files found in that folder.'; return; }
+  const byDir = {};
+  dcm.forEach(x => {
+    const dir = x.rel.slice(0, x.rel.lastIndexOf('/') + 1);
+    (byDir[dir] = byDir[dir] || []).push(x);
+  });
+  let files = [], dirName = '';
+  for (const [dir, list] of Object.entries(byDir))
+    if (list.length > files.length) { files = list; dirName = dir; }
+  dirName = dirName.replace(/\/$/, '').split('/').pop() || files[0].rel.split('/')[0] || 'uploaded scan';
+
+  const prog = $('progress'), fill = $('progFill'), txt = $('progTxt');
+  prog.style.display = 'block'; fill.style.width = '0%';
+  txt.textContent = `Checking ${files.length} slices…`;
+  try {
+    const {upload_id} = await api('/api/upload/start', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({folder: dirName, n_files: files.length})});
+    await putFile(upload_id, files[0].file);
+    const probe = await api(`/api/upload/${upload_id}/probe`);
+    if (!probe.known) {
+      // genuinely new scan: upload everything (first file already sent)
+      txt.textContent = 'New scan — uploading…';
+      let done = 1;
+      const rest = files.slice(1);
+      const pool = Array.from({length: 6}, async () => {
+        while (rest.length) {
+          const x = rest.shift();
+          await putFile(upload_id, x.file);
+          done++;
+          fill.style.width = (100 * done / files.length).toFixed(1) + '%';
+          txt.textContent = `Uploading ${done} / ${files.length} slices…`;
+        }
+      });
+      await Promise.all(pool);
+    } else {
+      const c = probe.context || {};
+      txt.textContent = `Recognised: subject ${c.subject || '?'} · ${c.timepoint || ''} — no upload needed.`;
+      fill.style.width = '100%';
+    }
+    const run = await api('/api/autorun', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({upload_id})});
+    txt.textContent = `Started: ${run.label} (${modeName(run.mode)})`;
+    selectJob(run.id);
+    refreshJobs();
+    setTimeout(() => { prog.style.display = 'none'; }, 4000);
+  } catch (e) {
+    $('dropError').textContent = e.message;
+    prog.style.display = 'none';
+  }
+}
+
+function putFile(uploadId, file) {
+  return api(`/api/upload/${uploadId}/file?name=${encodeURIComponent(file.name)}`,
+             {method: 'PUT', body: file});
+}
 
 document.querySelectorAll('input[name=mode]').forEach(r =>
   r.addEventListener('change', () =>
@@ -331,6 +463,19 @@ async function pollDetail(force) {
   }
   $('dTitle').textContent = `${j.label} — ${STATUS_LABEL[j.status] || j.status}`;
   $('cancelBtn').style.display = (j.status === 'running' || j.status === 'queued') ? '' : 'none';
+  const finished = (j.status || '').startsWith('done');
+  $('dlBtn').style.display = finished ? '' : 'none';
+  if (finished) $('dlBtn').href = `/api/jobs/${j.id}/download`;
+  if (changed('context', [j.context, j.placement_note, j.params])) {
+    const chips = [];
+    const c = j.context || {};
+    if (c.subject)   chips.push(`Subject <b>${c.subject}</b>`);
+    if (c.group)     chips.push(`Group <b>${c.group}</b>`);
+    if (c.timepoint) chips.push(`Timepoint <b>${c.timepoint}</b>`);
+    if (j.placement_note) chips.push(j.placement_note);
+    if (j.params && j.params.output) chips.push(`Output: ${j.params.output.split('/').pop()}`);
+    $('dContext').innerHTML = chips.map(x => `<span class="chip">${x}</span>`).join('');
+  }
   renderChecks(j); renderResults(j); renderPreview(j);
 }
 
@@ -363,8 +508,9 @@ function renderResults(j) {
   const el = $('dResults'), r = j.results, m = j.metrics || {};
   let html = '';
   const met = [];
-  if (m.tilt_deg != null)   met.push(['Axis tilt', m.tilt_deg.toFixed(1) + '°']);
-  if (m.eigenvalues)        met.push(['Eigenvalues mm²', m.eigenvalues.map(e => e.toFixed(1)).join(', ')]);
+  const hint = j.mode === 'later_reg' ? ' (detection hint)' : '';
+  if (m.tilt_deg != null)   met.push(['Axis tilt' + hint, m.tilt_deg.toFixed(1) + '°']);
+  if (m.eigenvalues)        met.push(['Eigenvalues mm²' + hint, m.eigenvalues.map(e => e.toFixed(1)).join(', ')]);
   if (m.dice != null)       met.push(['Registration dice', m.dice.toFixed(3)]);
   if (m.active_slices)      met.push(['Active slices', m.active_slices]);
   if (m.roi_enclosed_pct != null) met.push(['Template enclosed', m.roi_enclosed_pct.toFixed(1) + '%']);
