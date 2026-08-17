@@ -209,11 +209,13 @@
       <h2 style="display:flex; justify-content:space-between; gap:8px">
         <span id="dTitle"></span>
         <span>
+          <button id="adjBtn" style="display:none" onclick="openAdjust()">Adjust placement</button>
           <a id="dlBtn" style="display:none" href="#"><button>Download results</button></a>
           <button id="cancelBtn" style="display:none" onclick="cancelJob()">Cancel</button>
         </span>
       </h2>
       <div class="chips" id="dContext"></div>
+      <div id="adjPanel" style="display:none"></div>
       <div id="dChecks"></div>
       <div id="dResults"></div>
       <div id="dPreview"></div>
@@ -442,11 +444,13 @@ async function refreshJobs() {
     </div>`).join('');
 }
 const modeName = m => ({'3m': '3-month, network placement',
-  later_reg: 'registration placement', later_raw: 'RAW network placement'}[m] || m);
+  later_reg: 'registration placement', later_raw: 'RAW network placement',
+  manual: 'manual adjustment'}[m] || m);
 
 function selectJob(id) {
   selectedJob = id; logLen = 0;
   $('detailCard').style.display = '';
+  $('adjPanel').style.display = 'none';
   $('dLog').textContent = '';
   pollDetail(true);
   refreshJobs();
@@ -466,6 +470,8 @@ async function pollDetail(force) {
   const finished = (j.status || '').startsWith('done');
   $('dlBtn').style.display = finished ? '' : 'none';
   if (finished) $('dlBtn').href = `/api/jobs/${j.id}/download`;
+  $('adjBtn').style.display = finished ? '' : 'none';
+  lastJob = j;
   if (changed('context', [j.context, j.placement_note, j.params])) {
     const chips = [];
     const c = j.context || {};
@@ -481,6 +487,109 @@ async function pollDetail(force) {
 
 async function cancelJob() {
   if (selectedJob) await api(`/api/jobs/${selectedJob}/cancel`, {method: 'POST'});
+}
+
+// ── manual adjustment ───────────────────────────────────────
+let lastJob = null, adj = null;
+
+async function openAdjust() {
+  if (!selectedJob) return;
+  const panel = $('adjPanel');
+  panel.style.display = '';
+  panel.innerHTML = '<h2 style="margin-top:14px">Adjust placement</h2>' +
+    '<div class="note">Loading the reslice — this reads the scan volume and can take a minute…</div>';
+  try {
+    const meta = await api(`/api/jobs/${selectedJob}/adjust-view`);
+    renderAdjust(meta);
+  } catch (e) {
+    panel.innerHTML = `<div class="error">${e.message}</div>`;
+  }
+}
+
+function renderAdjust(meta) {
+  const n = meta.n_px, mmpx = meta.mm_per_px;
+  const cx = meta.center_px, cy = (n - 1) - meta.center_px;   // origin='lower' flip
+  adj = {meta, du: 0, dv: 0};
+  const circles = meta.radii_mm.map((r, i) =>
+    `<circle cx="${cx}" cy="${cy}" r="${r / mmpx}" fill="none"
+       stroke="${['#22d3ee', '#facc15', '#4ade80'][i]}" stroke-width="1.6"
+       stroke-dasharray="6 4" vector-effect="non-scaling-stroke"/>`).join('');
+  $('adjPanel').innerHTML = `
+    <h2 style="margin-top:14px">Adjust placement</h2>
+    <div class="note">Drag the rings so the core sits on the defect. This writes a NEW
+      series flagged as manually adjusted — the automatic result is kept unchanged.
+      ${lastJob && lastJob.mode === '3m'
+        ? '<span class="mode-warning">This is a 3-month scan: the automatic fit is validated to ~0.21 mm — moving it usually makes placement worse.</span>' : ''}</div>
+    <div id="adjWrap" style="position:relative; display:inline-block; margin-top:10px; max-width:100%">
+      <img id="adjImg" src="${meta.img}" style="width:min(460px,100%); display:block; border-radius:8px">
+      <svg id="adjSvg" viewBox="0 0 ${n} ${n}" preserveAspectRatio="none"
+           style="position:absolute; inset:0; width:100%; height:100%; cursor:grab; touch-action:none">
+        <g id="adjRings">${circles}
+          <line x1="${cx - 6}" y1="${cy}" x2="${cx + 6}" y2="${cy}" stroke="#f87171" stroke-width="1.4" vector-effect="non-scaling-stroke"/>
+          <line x1="${cx}" y1="${cy - 6}" x2="${cx}" y2="${cy + 6}" stroke="#f87171" stroke-width="1.4" vector-effect="non-scaling-stroke"/>
+        </g>
+      </svg>
+    </div>
+    <div class="inline">
+      <span id="adjReadout" style="font:600 13px var(--mono)">Δ = 0.00 mm</span>
+      <span id="adjWarn" class="mode-warning" style="display:none">large offset — prefer a re-run</span>
+    </div>
+    <div class="inline">
+      <button class="primary" style="width:auto; margin:0" onclick="applyAdjust()">Apply — write adjusted series</button>
+      <button onclick="resetAdjust()">Reset</button>
+      <button onclick="$('adjPanel').style.display='none'">Close</button>
+    </div>`;
+  const svg = $('adjSvg');
+  let dragging = null;
+  svg.addEventListener('pointerdown', e => {
+    dragging = {x: e.clientX, y: e.clientY, du: adj.du, dv: adj.dv};
+    svg.setPointerCapture(e.pointerId);
+    svg.style.cursor = 'grabbing';
+  });
+  svg.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const scale = svg.clientWidth / n;                 // css px per image px
+    let du = dragging.du + (e.clientX - dragging.x) / scale * mmpx;
+    let dv = dragging.dv - (e.clientY - dragging.y) / scale * mmpx;
+    adj.du = Math.max(-4, Math.min(4, du));
+    adj.dv = Math.max(-4, Math.min(4, dv));
+    const off = Math.hypot(adj.du, adj.dv);
+    $('adjRings').setAttribute('transform',
+      `translate(${adj.du / mmpx}, ${-adj.dv / mmpx})`);
+    $('adjReadout').textContent = `Δ = ${off.toFixed(2)} mm  (u ${adj.du >= 0 ? '+' : ''}${adj.du.toFixed(2)}, v ${adj.dv >= 0 ? '+' : ''}${adj.dv.toFixed(2)})`;
+    $('adjWarn').style.display = off > 2.5 ? '' : 'none';
+  });
+  const stop = () => { dragging = null; svg.style.cursor = 'grab'; };
+  svg.addEventListener('pointerup', stop);
+  svg.addEventListener('pointercancel', stop);
+}
+
+function resetAdjust() {
+  if (!adj) return;
+  adj.du = adj.dv = 0;
+  $('adjRings').setAttribute('transform', 'translate(0,0)');
+  $('adjReadout').textContent = 'Δ = 0.00 mm';
+  $('adjWarn').style.display = 'none';
+}
+
+async function applyAdjust() {
+  if (!adj) return;
+  const off = Math.hypot(adj.du, adj.dv);
+  if (off < 0.05) { alert('Drag the rings first — the offset is zero.'); return; }
+  let msg = `Write a new series shifted ${off.toFixed(2)} mm? It will be permanently flagged as manually adjusted.`;
+  if (lastJob && lastJob.mode === '3m')
+    msg += '\n\nNote: on 3-month scans the automatic fit is usually more accurate than the eye.';
+  if (off > 2.5)
+    msg += '\n\nThis is a large offset — if the automatic run was this far off, a re-run or registration is the better fix.';
+  if (!confirm(msg)) return;
+  try {
+    const r = await api(`/api/jobs/${selectedJob}/adjust`, {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({du_mm: adj.du, dv_mm: adj.dv})});
+    $('adjPanel').style.display = 'none';
+    selectJob(r.id);
+    refreshJobs();
+  } catch (e) { alert(e.message); }
 }
 
 // ── detail rendering ────────────────────────────────────────

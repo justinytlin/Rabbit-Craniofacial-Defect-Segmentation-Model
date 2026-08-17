@@ -71,6 +71,12 @@ scan folder in**. Everything else is automatic:
   **Download results** zip of every written series.
 - An **Advanced** panel keeps the fully manual run (explicit placement mode,
   reference, threshold, overwrite) for the pipeline maintainer.
+- **Adjust placement** on a finished run overlays draggable rings on the
+  axial reslice for small manual nudges. The nudge re-stamps the template
+  (`stamp_roi.py`) as a NEW `…_adj` series permanently flagged as manually
+  adjusted — the automatic result is never modified, 3-month scans get an
+  extra caution (the eye loses to the fit there, 11/12 on GT), and moves
+  beyond 6 mm are refused outright: that's a re-run, not a nudge.
 
 Run history and logs persist in `logs/webapp/`. To let other lab machines use
 one shared instance, start it with `python3 webapp.py --host 0.0.0.0` and open
@@ -366,6 +372,7 @@ to train the 2.5D variant from scratch.
 3_inference.py           predict + stamp the ROI template → DICOM series
 4_propagate_roi.py       place later-timepoint ROIs by registration (use it!)
 webapp.py + webapp.html  local web app wrapping 3 & 4 for lab use
+stamp_roi.py             stamp the template at an explicit pose (manual nudges)
 Launch Defect Segmenter.command   double-click launcher for the web app
 model.py                 U-Net, Dice / focal / combined losses
 axial_view.py            reslice perpendicular to the fitted defect axis

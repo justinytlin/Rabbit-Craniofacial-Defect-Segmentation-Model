@@ -225,7 +225,10 @@ def detect_context(input_dir: Path) -> dict:
                             continue
                         n = e.name
                         if is_roi_series_name(n):
-                            rois.append(Path(e.path))
+                            # an empty GT folder exists for some animals —
+                            # only a series with actual files can be a reference
+                            if count_dcm(Path(e.path), cap=10) > 0:
+                                rois.append(Path(e.path))
                         elif count_dcm(Path(e.path), cap=600) >= 500:
                             dicoms.append(Path(e.path))
                 except OSError:
@@ -235,11 +238,55 @@ def detect_context(input_dir: Path) -> dict:
                     info['ref_roi'] = str(gt[0])
                 elif rois:
                     info['ref_roi'] = str(rois[0])
-                pref = [d for d in dicoms if d.name.startswith('dicom')]
+                pref = [d for d in dicoms if 'dicom' in d.name.lower()]
                 if pref or dicoms:
                     info['ref_input'] = str((pref or dicoms)[0])
                 break
     return info
+
+
+ADJUST_LOCK = threading.Lock()
+
+def build_adjust_view(job) -> dict:
+    """Reslice the scan perpendicular to the run's fitted axis and cache a
+    clean image + geometry meta for the manual-adjustment overlay."""
+    adj_dir = APP_DIR / 'adjust'
+    adj_dir.mkdir(parents=True, exist_ok=True)
+    meta_f = adj_dir / f'{job["id"]}.json'
+    png_f = adj_dir / f'{job["id"]}.png'
+    if meta_f.exists() and png_f.exists():
+        return json.loads(meta_f.read_text())
+
+    with ADJUST_LOCK:                      # one subvolume load at a time
+        if meta_f.exists() and png_f.exists():
+            return json.loads(meta_f.read_text())
+        sys.path.insert(0, str(REPO_DIR))
+        from axial_view import AxialView
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.image as mpimg
+        import numpy as np
+
+        av = AxialView(job['params']['input'], job['params']['output'],
+                       fov_mm=13.0)
+        img, uv = av.slab()                # 8 mm slab MIP, ⟂ to fitted axis
+        nz = img[img > 0]
+        vmin, vmax = (np.percentile(nz, [1, 99]) if nz.size else (0.0, 1.0))
+        arr = np.clip((img.T - vmin) / max(1e-6, vmax - vmin), 0, 1)
+        mpimg.imsave(png_f, arr, cmap='gray', origin='lower', vmin=0, vmax=1)
+
+        step = float(uv[1] - uv[0])
+        meta = {'job': job['id'],
+                'n_px': int(len(uv)),
+                'mm_per_px': step,
+                'center_px': float(-uv[0] / step),
+                'center_mm': av.center_mm.tolist(),
+                'axis': av.axis.tolist(),
+                'e1': av.e1.tolist(), 'e2': av.e2.tolist(),
+                'tilt_deg': av.tilt_deg,
+                'radii_mm': [5.0, 7.0, 9.0]}
+        meta_f.write_text(json.dumps(meta))
+        return meta
 
 
 def auto_version_output(base: Path) -> Path:
@@ -352,8 +399,15 @@ def _run_job(job):
                 cmd.append('--wide-search')
             rc = run_step(job, cmd, fh)
             if rc != 0:
-                raise RuntimeError(f'registration step exited with code {rc} '
-                                   '(see log — a dice below --dice-min refuses to write)')
+                raise RuntimeError(f'registration step exited with code {rc} — '
+                                   'see the end of the console log for the cause '
+                                   '(a dice below --dice-min also refuses to write)')
+        elif job['mode'] == 'manual':
+            rc = run_step(job, [PYTHON, 'stamp_roi.py', '--input', p['input'],
+                                '--output', out, '--pose', p['pose'],
+                                '--bone-refine', '--bone-threshold', thr], fh)
+            if rc != 0:
+                raise RuntimeError(f'stamping exited with code {rc}')
         else:
             cmd = [PYTHON, '3_inference.py', '--input', p['input'],
                    '--output', out, '--bone-refine', '--bone-threshold', thr]
@@ -499,7 +553,24 @@ def build_checks(job) -> list:
     def add(name, status, detail):
         checks.append({'name': name, 'status': status, 'detail': detail})
 
-    if job['mode'] == '3m':
+    if job['mode'] == 'manual':
+        off = job.get('manual_offset_mm')
+        add('Placement method', 'warn',
+            f'MANUALLY ADJUSTED — nudged {off} mm off the automatic placement '
+            f'of {job.get("placement_note", "").replace("manual nudge of ", "")}. '
+            'Flag this series as manually placed in any analysis; never mix it '
+            'with automatically placed ROIs in a comparison.')
+        if off is not None and off > 2.5:
+            add('Offset size', 'warn',
+                f'{off} mm is a large manual move. If the automatic run was this '
+                'far off, prefer re-running (or registration) over dragging.')
+        if job.get('parent_mode') == '3m':
+            add('3-month caution', 'warn',
+                'The parent run is a 3-month scan, where the automatic fit '
+                'matches the annotation protocol to ~0.21 mm. A validated study '
+                'finding: visually "better-centred" placements were WORSE on '
+                '11 of 12 ground-truth subjects.')
+    elif job['mode'] == '3m':
         add('Placement method', 'pass',
             'Direct network placement — 3-month scans are the training '
             'timepoint (centre accurate to ~0.21 mm on GT).')
@@ -524,6 +595,8 @@ def build_checks(job) -> list:
         return checks
 
     tilt = m.get('tilt_deg')
+    if job['mode'] == 'manual':
+        tilt = None                      # axis inherited from the parent run
     if job['mode'] == 'later_reg':
         # In a registration job the parsed tilt/eigenvalues describe the
         # network's detection hint on an out-of-distribution timepoint — the
@@ -662,6 +735,32 @@ class Handler(BaseHTTPRequestHandler):
                                    ('subject', 'group', 'timepoint', 'is_3m')}
             self._json(resp)
 
+        elif route.startswith('/api/jobs/') and route.endswith('/adjust-view'):
+            jid = route.split('/')[3]
+            job = JOBS.get(jid)
+            if not job:
+                return self._err('no such job', 404)
+            if not Path(job['params']['input']).is_dir():
+                return self._err('the run\'s input scan is no longer available')
+            try:
+                meta = build_adjust_view(job)
+            except Exception as e:                      # noqa: BLE001
+                return self._err(f'could not build the adjust view: {e}', 500)
+            meta['img'] = f'/api/adjust-img?job={jid}'
+            self._json(meta)
+
+        elif route == '/api/adjust-img':
+            p = APP_DIR / 'adjust' / f'{Path(q.get("job", "")).name}.png'
+            if not p.is_file():
+                return self._err('no adjust image', 404)
+            body = p.read_bytes()
+            self.send_response(200)
+            self.send_header('Cache-Control', 'max-age=300')
+            self.send_header('Content-Type', 'image/png')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif route.startswith('/api/jobs/') and route.endswith('/download'):
             jid = route.split('/')[3]
             job = JOBS.get(jid)
@@ -780,6 +879,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == '/api/autorun':
             return self._autorun(payload)
+
+        if route.startswith('/api/jobs/') and route.endswith('/adjust'):
+            return self._adjust(route.split('/')[3], payload)
 
         if route.startswith('/api/upload/') and route.endswith('/discard'):
             uid = route.split('/')[3]
@@ -905,6 +1007,58 @@ class Handler(BaseHTTPRequestHandler):
         self._json({'id': jid, 'mode': mode, 'label': label,
                     'context': job['context'],
                     'placement_note': placement_note})
+
+    def _adjust(self, parent_id, p):
+        """Apply a manual in-plane nudge: re-stamp the template at the shifted
+        centre as a NEW flagged series; the automatic run is never modified."""
+        parent = JOBS.get(parent_id)
+        if not parent:
+            return self._err('no such job', 404)
+        meta_f = APP_DIR / 'adjust' / f'{parent_id}.json'
+        if not meta_f.exists():
+            return self._err('open the adjust view first')
+        try:
+            du = float(p.get('du_mm', 0)); dv = float(p.get('dv_mm', 0))
+        except (TypeError, ValueError):
+            return self._err('du_mm / dv_mm must be numbers')
+        offset = (du * du + dv * dv) ** 0.5
+        if offset < 0.05:
+            return self._err('offset is essentially zero — nothing to apply')
+        if offset > 6.0:
+            return self._err(f'offset {offset:.1f} mm is too large for a manual '
+                             'nudge — a mis-detection should be re-run, not dragged')
+        meta = json.loads(meta_f.read_text())
+        c = [meta['center_mm'][i] + du * meta['e1'][i] + dv * meta['e2'][i]
+             for i in range(3)]
+        parent_out = Path(parent['params']['output'])
+        output = auto_version_output(parent_out.parent / (parent_out.name + '_adj'))
+        pose_f = APP_DIR / 'adjust' / f'{parent_id}_{output.name}_pose.json'
+        pose_f.write_text(json.dumps({
+            'center_mm': c, 'axis': meta['axis'],
+            'note': f'manual nudge {offset:.2f} mm (du={du:+.2f}, dv={dv:+.2f}) '
+                    f'from {parent["label"]}'}))
+
+        jid = uuid.uuid4().hex[:12]
+        job = {'id': jid, 'created': time.time(), 'status': 'queued',
+               'mode': 'manual', 'label': output.name,
+               'parent': parent_id, 'manual_offset_mm': round(offset, 2),
+               'parent_mode': parent['mode'],
+               'context': parent.get('context'),
+               'placement_note': f'manual nudge of {parent["label"]}',
+               'params': {'input': parent['params']['input'],
+                          'output': str(output), 'pose': str(pose_f),
+                          'ref_input': None, 'ref_roi': None,
+                          'bone_threshold': parent['params'].get(
+                              'bone_threshold', DEFAULT_BONE_THRESHOLD),
+                          'wide_search': False, 'overwrite': False}}
+        job_log_path(jid).write_text(
+            f'Manual adjustment of {parent["label"]}: '
+            f'du={du:+.2f} mm, dv={dv:+.2f} mm (|Δ|={offset:.2f} mm)\n')
+        with JOB_LOCK:
+            JOBS[jid] = job
+        save_jobs()
+        JOB_QUEUE.put(jid)
+        self._json({'id': jid, 'label': output.name, 'offset_mm': round(offset, 2)})
 
     def _start_job(self, p):
         mode = p.get('mode')

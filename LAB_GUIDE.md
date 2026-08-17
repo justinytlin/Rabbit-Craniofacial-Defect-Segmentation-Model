@@ -63,6 +63,27 @@ next to the scan (e.g. `37951_6m_output_dicom…`) ready for the existing
 analysis workflow. For uploaded scans — or to take results elsewhere — click
 **Download results** for a zip.
 
+## Nudging the placement by hand (use sparingly)
+
+If a finished run's circles look slightly off the defect, open the run and
+click **Adjust placement**. After the reslice loads, drag the rings so the
+core sits on the defect — the offset shows live in mm — and click
+**Apply — write adjusted series**.
+
+Three things to know before you use it:
+
+- The automatic result is **never modified**. Your nudge writes a *new* series
+  (`…_adj`), and that series is **permanently flagged as manually adjusted**
+  in its checks. Never mix manually placed and automatically placed ROIs in
+  the same comparison.
+- **On 3-month scans, don't.** The automatic fit matches the annotation
+  protocol to ~0.21 mm; in a validated test, placements that "looked more
+  centred" were actually *worse* on 11 of 12 subjects. The app will remind
+  you.
+- A nudge is for **small** corrections (a millimetre or two). If the rings are
+  far from the defect, the detection failed — re-run instead, and the app
+  blocks nudges beyond 6 mm for exactly that reason.
+
 ---
 
 ## If something goes wrong
