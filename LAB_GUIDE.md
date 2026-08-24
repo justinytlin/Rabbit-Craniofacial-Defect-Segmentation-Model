@@ -31,6 +31,11 @@ rest on its own:
   - *Scan it doesn't recognise* → the whole scan uploads (a few GB — give it
     a few minutes), then AI placement runs and the result is clearly flagged
     so you know the timepoint rules above couldn't be checked.
+  - *Ex vivo specimen scan* (excised skull piece on the SCANCO µCT) → the AI
+    isn't used at all: the defect is already the centre of the specimen, so
+    the app finds it geometrically from the bone itself and stamps the same
+    10/18 mm template. Ex vivo numbers are measured at ~15 µm — compare them
+    only with other ex vivo numbers, never with in vivo ones.
 - Re-running a scan never destroys anything: results get a `_v2`, `_v3`…
   name, and the hand-labeled ground-truth folders can't be overwritten at all.
 

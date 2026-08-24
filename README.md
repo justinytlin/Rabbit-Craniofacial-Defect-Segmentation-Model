@@ -57,8 +57,11 @@ scan folder in**. Everything else is automatic:
 - **Placement mode is chosen for you.** 3-month scans run direct network
   placement; any other recognised timepoint runs registration from the
   animal's 3-month ROI (`4_propagate_roi.py`), with the reference scan and
-  ground-truth ROI located automatically. Unrecognised scans fall back to
-  network placement and the results are flagged with the placement caveat.
+  ground-truth ROI located automatically. Ex vivo specimen scans (SCANCO
+  µCT, recognised by voxel size / scanner / location in `Ex Vivo CT Data`)
+  run geometric placement (`5_exvivo_roi.py`) with ex vivo-specific sanity
+  checks. Unrecognised scans fall back to network placement and the results
+  are flagged with the placement caveat.
 - **Nothing is destroyed by a re-run**: outputs auto-version (`…_v2`, `…_v3`),
   and hand-labeled ground-truth series (`<id>_output_dicom`) can never be
   overwritten — the app refuses that output name outright.
@@ -289,6 +292,61 @@ correctly *refused* by the dice gate rather than silently mis-measured, across
 four escalating configurations. If a scan fails the gate, prefer re-exporting it
 at original resolution over lowering `--dice-min`.
 
+## Ex vivo specimen scans — `5_exvivo_roi.py`
+
+Ex vivo scans (SCANCO µCT of excised calvarial specimens, ~15 µm voxels,
+~1770×1800 × 600–820 slices) are a different problem from in vivo scans, and
+the network cannot be used on them at all — the resolution, orientation
+(plate near the slice plane instead of 74–88° oblique), and appearance (air
+background, no soft tissue) are far outside its training distribution, and it
+predicts zero defect voxels. There is also nothing to *search* for: the
+specimen IS the defect region, excised around the trephine site.
+
+`5_exvivo_roi.py` therefore places the same rigid template geometrically:
+
+```bash
+python 5_exvivo_roi.py --input EXVIVO_DICOM_DIR --output 261_5776_exvivo_output_dicom --bone-refine
+```
+
+1. A downsampled bone-fraction volume (~0.06 mm in Z, ~0.12 mm in-plane,
+   ~40 MB regardless of scan size) is built with a 500 HU *placement*
+   threshold (deliberately above the 226 HU BV/TV threshold — it only
+   affects where the template lands, and the 15 µm noise floor is high).
+2. The **plate normal = defect axis** comes from weighted PCA on the largest
+   connected bone component (smallest-variance eigenvector), re-fitted once
+   on bone near the defect so cut edges and the sagittal crest don't bias it.
+   Expect a tilt near 0° from the slice axis — the *opposite* of the in vivo
+   envelope, because specimens are scanned lying flat.
+3. The **centre** comes from a matched filter for the **trephine edge** on
+   the HU deficit of the ±2 mm plate mid-slab: a dark *moat* annulus at the
+   cut radius (3.8–6 mm) minus intact plate (no deficit) in the 14–18 mm
+   ring, each mean normalised by its on-specimen area. Why a moat and not a
+   disk: at 6 months a treated defect is often a re-mineralised central
+   island ringed by a dark moat along the old cut, which a "darkest 10 mm
+   disk" filter skips; the area normalisation and the ring penalty are what
+   reject dark beveled cut rims at the specimen edge. A ring−core
+   *thickness* filter gives the coarse start, and open (air) defects count
+   as deficit because the specimen region is the bone support with holes
+   filled. Candidates are gated on mid-slab bone covering ≥60 % of the ring.
+4. The standard five DICOM series are written at **native 15 µm resolution**
+   through `3_inference.py`'s writers, so the format matches the in vivo
+   outputs. Budget several GB per scan and ~10–20 min of writing; the
+   `_axial_view.png` preview is rendered from the analysis volume (a native
+   reslice would need a ~10 GB subvolume — `axial_view.AxialView` gets an
+   automatic decimation `stride` for the same reason).
+
+Sanity signals to check before trusting a run: `defect HU deficit` (mean HU
+missing over the core vs the surrounding plate median; below ~150 HU the
+defect may be fully bridged and placement is uncertain — the web app flags
+it), `ring bone coverage`, and the tilt (≤ ~30°). Verified on the six
+261/57xx hydrogel specimens: four place cleanly with 400–670 HU deficits;
+two low-contrast, well-healed specimens are flagged for visual confirmation.
+
+**Do not compare ex vivo numbers with in vivo numbers.** Partial-volume
+behaviour at 15 µm vs 100 µm makes BV/TV at the same threshold a different
+measurement; compare ex vivo only with ex vivo, and state the threshold as
+always.
+
 ### Throughput
 
 One scan takes ~4–5 minutes unattended (Apple M-series): ~1–2 min for the
@@ -371,6 +429,7 @@ to train the 2.5D variant from scratch.
 2_train.py               train the U-Net
 3_inference.py           predict + stamp the ROI template → DICOM series
 4_propagate_roi.py       place later-timepoint ROIs by registration (use it!)
+5_exvivo_roi.py          place the ROI on ex vivo specimen scans (no network)
 webapp.py + webapp.html  local web app wrapping 3 & 4 for lab use
 stamp_roi.py             stamp the template at an explicit pose (manual nudges)
 Launch Defect Segmenter.command   double-click launcher for the web app

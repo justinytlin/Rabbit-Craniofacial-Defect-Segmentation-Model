@@ -168,6 +168,9 @@
       <label class="radio"><input type="radio" name="mode" value="later_raw">
         <span><b>Later timepoint</b> — raw network placement<br>
         <span class="modehelp mode-warning">Only if no 3-month scan exists: the network is 2–3 mm biased at later timepoints.</span></span></label>
+      <label class="radio"><input type="radio" name="mode" value="exvivo">
+        <span><b>Ex vivo specimen</b> — geometric placement (no network)<br>
+        <span class="modehelp">For excised-calvaria µCT scans (SCANCO, ~15 µm): the defect is located from the specimen itself. Auto-selected when such a scan is recognised.</span></span></label>
 
       <div id="refBlock" style="display:none">
         <label>Reference 3-month scan (DICOM folder)</label>
@@ -384,7 +387,8 @@ async function suggest() {
     chips.push(`<b>${s.n_dcm}</b> DICOM slices`);
     $('ctxChips').innerHTML = chips.map(c => `<span class="chip">${c}</span>`).join('');
     if (s.suggested_output && !$('output').value) $('output').value = s.suggested_output;
-    if (s.is_3m === true) setMode('3m');
+    if (s.exvivo) setMode('exvivo');
+    else if (s.is_3m === true) setMode('3m');
     else if (s.is_3m === false) {
       setMode('later_reg');
       if (s.ref_input) $('ref_input').value = s.ref_input;
@@ -445,6 +449,7 @@ async function refreshJobs() {
 }
 const modeName = m => ({'3m': '3-month, network placement',
   later_reg: 'registration placement', later_raw: 'RAW network placement',
+  exvivo: 'ex vivo geometric placement',
   manual: 'manual adjustment'}[m] || m);
 
 function selectJob(id) {
@@ -624,6 +629,8 @@ function renderResults(j) {
   if (m.active_slices)      met.push(['Active slices', m.active_slices]);
   if (m.roi_enclosed_pct != null) met.push(['Template enclosed', m.roi_enclosed_pct.toFixed(1) + '%']);
   if (m.void_offset_mm != null) met.push(['Void offset', m.void_offset_mm.toFixed(2) + ' mm']);
+  if (m.defect_deficit_hu != null) met.push(['Defect HU deficit', m.defect_deficit_hu.toFixed(0) + ' HU']);
+  if (m.ring_coverage_pct != null) met.push(['Ring coverage', m.ring_coverage_pct.toFixed(0) + '%']);
   if (met.length)
     html += '<h2 style="margin-top:14px">Fit</h2><div class="metrics">' +
       met.map(([k, v]) => `<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('') + '</div>';

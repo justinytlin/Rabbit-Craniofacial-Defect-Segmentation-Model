@@ -51,7 +51,14 @@ EIG1_RANGE = (3.5, 7.5)        # GT 5.33 mm², predictions ~5.47
 EIG23_RANGE = (14.0, 30.0)     # GT 20.98 / 20.99 mm²
 SERIES_SUFFIXES = ['', '_cylinder', '_ring', '_cylinder_bone', '_ring_bone']
 
-ALLOWED_ROOTS = [DATA_ROOT]
+# Ex vivo specimen archive (SCANCO µCT scans of excised calvaria). Sits next
+# to the in vivo tree; may be absent on machines without that data.
+EXVIVO_ROOT = DATA_ROOT.parent / 'Ex Vivo CT Data'
+# A voxel this small can only be a specimen µCT — in vivo scans are 0.1 mm.
+EXVIVO_MAX_SPACING_MM = 0.03
+
+ALLOWED_ROOTS = [DATA_ROOT] + ([EXVIVO_ROOT] if EXVIVO_ROOT.is_dir() else [])
+SCAN_ROOTS = list(ALLOWED_ROOTS)
 
 UPLOADS_DIR = APP_DIR / 'uploads'
 INDEX_FILE = APP_DIR / 'scan_index.json'
@@ -116,6 +123,40 @@ def read_study_id(dcm_path: Path):
         return None
 
 
+def read_patient_id(dcm_path: Path):
+    try:
+        import pydicom
+        ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=True)
+        pid = str(getattr(ds, 'PatientID', '') or '').strip()
+        return pid or None
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def scan_is_exvivo(input_dir: Path) -> bool:
+    """Ex vivo specimen scans get geometric placement — the in vivo network
+    cannot process them (15 µm SCANCO µCT, en-face orientation, no soft
+    tissue; it predicts nothing on them). Recognised by location in the ex
+    vivo archive, by voxel size, or by scanner make."""
+    try:
+        if EXVIVO_ROOT.is_dir() and EXVIVO_ROOT in input_dir.resolve().parents:
+            return True
+    except OSError:
+        pass
+    f = first_dcm(input_dir)
+    if not f:
+        return False
+    try:
+        import pydicom
+        ds = pydicom.dcmread(str(f), stop_before_pixels=True)
+        ps = getattr(ds, 'PixelSpacing', None)
+        if ps is not None and float(ps[0]) <= EXVIVO_MAX_SPACING_MM:
+            return True
+        return 'SCANCO' in str(getattr(ds, 'Manufacturer', '')).upper()
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
 def first_dcm(d: Path):
     try:
         with os.scandir(d) as it:
@@ -136,24 +177,25 @@ def build_scan_index():
                                if Path(v).is_dir()})
             INDEX_STATE['status'] = 'ready'
         fresh = {}
-        for dirpath, dirnames, filenames in os.walk(DATA_ROOT):
-            rel_depth = len(Path(dirpath).parts) - len(DATA_ROOT.parts)
-            dirnames[:] = [d for d in dirnames if not d.startswith('.')
-                           and d != 'defect_segmentation'
-                           and 'output_dicom' not in d]
-            if rel_depth >= 5:
-                dirnames[:] = []
-            d = Path(dirpath)
-            n = sum(1 for f in filenames if f.lower().endswith('.dcm'))
-            if n < 500 or 'output_dicom' in d.name:
-                continue
-            f = first_dcm(d)
-            sid = read_study_id(f) if f else None
-            if not sid:
-                continue
-            # Prefer canonical dicom_t* dirs over duplicate exports.
-            if sid not in fresh or d.name.startswith('dicom'):
-                fresh[sid] = str(d)
+        for root in SCAN_ROOTS:
+            for dirpath, dirnames, filenames in os.walk(root):
+                rel_depth = len(Path(dirpath).parts) - len(root.parts)
+                dirnames[:] = [d for d in dirnames if not d.startswith('.')
+                               and d != 'defect_segmentation'
+                               and 'output_dicom' not in d]
+                if rel_depth >= 5:
+                    dirnames[:] = []
+                d = Path(dirpath)
+                n = sum(1 for f in filenames if f.lower().endswith('.dcm'))
+                if n < 500 or 'output_dicom' in d.name:
+                    continue
+                f = first_dcm(d)
+                sid = read_study_id(f) if f else None
+                if not sid:
+                    continue
+                # Prefer canonical dicom_t* dirs over duplicate exports.
+                if sid not in fresh or d.name.startswith('dicom'):
+                    fresh[sid] = str(d)
         SCAN_INDEX.clear()
         SCAN_INDEX.update(fresh)
         INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -408,6 +450,12 @@ def _run_job(job):
                                 '--bone-refine', '--bone-threshold', thr], fh)
             if rc != 0:
                 raise RuntimeError(f'stamping exited with code {rc}')
+        elif job['mode'] == 'exvivo':
+            rc = run_step(job, [PYTHON, '5_exvivo_roi.py', '--input', p['input'],
+                                '--output', out,
+                                '--bone-refine', '--bone-threshold', thr], fh)
+            if rc != 0:
+                raise RuntimeError(f'ex vivo placement exited with code {rc}')
         else:
             cmd = [PYTHON, '3_inference.py', '--input', p['input'],
                    '--output', out, '--bone-refine', '--bone-threshold', thr]
@@ -475,6 +523,10 @@ def parse_metrics(log: str) -> dict:
     off = re.search(r'low-density centroid[^\n]*→\s*([\d.]+) mm', log)
     if off:
         m['void_offset_mm'] = float(off.group(1))
+    # Ex vivo placement metrics (5_exvivo_roi.py)
+    m['defect_deficit_hu'] = grab(r'defect HU deficit\s*:\s*([\d.]+) HU')
+    m['ring_coverage_pct'] = grab(r'ring bone coverage\s*:\s*([\d.]+)%')
+    m['weak_deficit'] = 'weak defect HU deficit' in log
     return {k: v for k, v in m.items() if v is not None and v is not False}
 
 
@@ -578,6 +630,13 @@ def build_checks(job) -> list:
         add('Placement method', 'pass',
             'Registration from the 3-month reference ROI — the validated '
             'workflow for non-3-month scans.')
+    elif job['mode'] == 'exvivo':
+        add('Placement method', 'pass',
+            'Ex vivo geometric placement — the defect is located from the '
+            'specimen itself (plate normal by PCA, centre by the HU deficit '
+            'of the plate mid-slab); no network involved. Ex vivo BV/TV is '
+            'measured at ~15 µm and is NOT comparable to in vivo numbers '
+            'from the same threshold — compare ex vivo only with ex vivo.')
     elif 'new scan' in (job.get('placement_note') or ''):
         add('Placement method', 'warn',
             'Network placement on a scan the app could not match to the study '
@@ -597,6 +656,41 @@ def build_checks(job) -> list:
     tilt = m.get('tilt_deg')
     if job['mode'] == 'manual':
         tilt = None                      # axis inherited from the parent run
+    if job['mode'] == 'exvivo':
+        # Specimens are scanned lying flat, so the plate normal sits NEAR the
+        # slice axis — the opposite of the in vivo 74–88° envelope, which must
+        # not be applied here.
+        if tilt is not None:
+            if tilt <= 30:
+                add('Axis tilt', 'pass',
+                    f'{tilt:.1f}° from the slice axis — a flat-mounted '
+                    'specimen is expected close to 0°.')
+            else:
+                add('Axis tilt', 'warn',
+                    f'{tilt:.1f}° — unusually tilted for a flat-mounted '
+                    'specimen; inspect the axial preview.')
+        tilt = None
+        dh = m.get('defect_deficit_hu')
+        if dh is not None:
+            if m.get('weak_deficit'):
+                add('Defect visibility', 'warn',
+                    f'Mean HU deficit over the core is only {dh:.0f} HU — the '
+                    'defect may be fully bridged; verify placement on the '
+                    'preview before quoting numbers.')
+            else:
+                add('Defect visibility', 'pass',
+                    f'{dh:.0f} HU mean deficit over the core vs the '
+                    'surrounding plate — clear defect signal.')
+        cov = m.get('ring_coverage_pct')
+        if cov is not None:
+            if cov >= 80:
+                add('Ring coverage', 'pass',
+                    f'Specimen covers {cov:.0f}% of the reference ring.')
+            else:
+                add('Ring coverage', 'warn',
+                    f'Specimen covers only {cov:.0f}% of the reference ring — '
+                    'ring BV/TV is measured on a partial annulus; the '
+                    'core-to-ring ratio may be biased.')
     if job['mode'] == 'later_reg':
         # In a registration job the parsed tilt/eigenvalues describe the
         # network's detection hint on an out-of-distribution timepoint — the
@@ -675,7 +769,11 @@ def build_checks(job) -> list:
             add('Registration dice', 'fail', f'{dice:.3f} — registration failed.')
 
     r = job.get('results') or {}
-    if r.get('bvtv_ring') is not None and r['bvtv_ring'] < 0.30:
+    if job['mode'] != 'exvivo' and r.get('bvtv_ring') is not None \
+            and r['bvtv_ring'] < 0.30:
+        # The 40–50% ceiling is an in vivo number (8 mm template vs ~4 mm
+        # plate at 0.1 mm voxels); ex vivo plates are thinner and voxels 6-7x
+        # smaller, so that envelope does not transfer.
         add('Reference ring', 'warn',
             f'Ring BV/TV {100 * r["bvtv_ring"]:.1f}% is below the expected '
             '~40–50% dilution ceiling — the ring may not be seated in intact bone.')
@@ -818,7 +916,14 @@ class Handler(BaseHTTPRequestHandler):
             p = Path(q.get('input', ''))
             if not p.is_dir():
                 return self._err('input directory not found')
-            self._json(detect_context(p))
+            ctx = detect_context(p)
+            if scan_is_exvivo(p):
+                ctx['exvivo'] = True
+                pid = read_patient_id(first_dcm(p))
+                base = '_'.join(x for x in (pid, p.name) if x) \
+                    + '_exvivo_output_dicom'
+                ctx['suggested_output'] = str(p.parent / base)
+            self._json(ctx)
 
         elif route == '/api/jobs':
             with JOB_LOCK:
@@ -966,7 +1071,19 @@ class Handler(BaseHTTPRequestHandler):
 
         ctx = detect_context(input_dir)
         in_uploads = UPLOADS_DIR in input_dir.parents
-        if in_uploads:
+        if scan_is_exvivo(input_dir):
+            # Ex vivo specimen: geometric placement, no timepoint/reference.
+            mode = 'exvivo'
+            placement_note += ' — ex vivo specimen'
+            pid = read_patient_id(first_dcm(input_dir))
+            base = '_'.join(x for x in (pid, input_dir.name) if x) \
+                + '_exvivo_output_dicom'
+            if in_uploads:
+                output = input_dir.parent / base
+            else:
+                output = auto_version_output(input_dir.parent / base)
+            label = base
+        elif in_uploads:
             # Unknown uploaded scan: outputs live in the upload folder, the
             # timepoint is unknown, and no reference can be located.
             mode = 'later_raw'
@@ -1062,8 +1179,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _start_job(self, p):
         mode = p.get('mode')
-        if mode not in ('3m', 'later_reg', 'later_raw'):
-            return self._err('mode must be 3m, later_reg or later_raw')
+        if mode not in ('3m', 'later_reg', 'later_raw', 'exvivo'):
+            return self._err('mode must be 3m, later_reg, later_raw or exvivo')
         input_dir = Path(p.get('input') or '')
         if not p.get('input') or not input_dir.is_dir() or count_dcm(input_dir, cap=10) == 0:
             return self._err('input directory does not exist or contains no .dcm files')

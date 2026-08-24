@@ -52,7 +52,11 @@ class AxialView:
     """Loads a masked output series, fits its cylinder axis, and reslices the CT
     perpendicular to that axis."""
 
-    def __init__(self, input_dir, output_dir, fov_mm=11.0, load_margin_mm=3.0):
+    def __init__(self, input_dir, output_dir, fov_mm=11.0, load_margin_mm=3.0,
+                 stride=None):
+        """`stride` decimates the load in all three axes. Default: chosen so the
+        effective voxel is ~0.1 mm — 1 (unchanged) for the in vivo scans, ~7 for
+        15 µm ex vivo µCT, whose native subvolume would be ~10 GB."""
         self.input_dir  = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.fov_mm     = float(fov_mm)
@@ -70,42 +74,52 @@ class AxialView:
             sz = float(np.linalg.norm(p1 - p0))
         else:
             sz = float(getattr(ds_in0, 'SliceThickness', ps[0]))
-        self.spacing = np.array([sz, ps[0], ps[1]])
+        self.native_spacing = np.array([sz, ps[0], ps[1]])
+        if stride is None:
+            stride = max(1, int(round(0.1 / float(self.native_spacing.min()))))
+        self.stride = k = int(stride)
+        self.spacing = self.native_spacing * k    # sampling-grid spacing
 
-        # ── Collect mask voxels in FULL-frame coordinates ────────────────────
+        # ── Collect mask voxels in FULL-frame NATIVE coordinates ─────────────
         r0 = c0 = None
         pts, self.active_k = [], []
-        for k, (inst, p) in enumerate(hdr_out):
-            arr = pydicom.dcmread(str(p)).pixel_array
+        for zi in range(0, len(hdr_out), k):
+            inst, p = hdr_out[zi]
+            arr = pydicom.dcmread(str(p)).pixel_array[::k, ::k]
             if not arr.any():
                 continue
             if r0 is None:
                 r0, c0 = _crop_offset(ds_in0, pydicom.dcmread(str(p), stop_before_pixels=True))
             rr, cc = np.where(arr != 0)
-            pts.append(np.stack([np.full(rr.shape, k), rr + r0, cc + c0], axis=1))
-            self.active_k.append(k)
+            pts.append(np.stack([np.full(rr.shape, zi), rr * k + r0, cc * k + c0], axis=1))
+            self.active_k.append(zi)
         if not pts:
             raise ValueError(f'No non-empty slices in {self.output_dir}')
         coords = np.concatenate(pts, axis=0).astype(np.float64)
         self.crop_origin = (r0, c0)
 
-        self.center_mm, self.axis, self.eigvals = fit_axis(coords * self.spacing)
+        self.center_mm, self.axis, self.eigvals = fit_axis(
+            coords * self.native_spacing)
         self.geom = OrientedCylinder(self.center_mm, self.axis, self.spacing)
 
         # ── Load only the CT subvolume the reslice can reach ─────────────────
         half = self.geom.bbox_half_mm() + load_margin_mm + max(0.0, fov_mm - self.geom.r_out)
-        lo = np.floor((self.center_mm - half) / self.spacing).astype(int)
-        hi = np.ceil((self.center_mm + half) / self.spacing).astype(int)
+        lo = np.floor((self.center_mm - half) / self.native_spacing).astype(int)
+        hi = np.ceil((self.center_mm + half) / self.native_spacing).astype(int)
         ds_h, ds_w = ds_in0.Rows, ds_in0.Columns
         self.z0 = max(0, lo[0]); self.z1 = min(len(hdr_in) - 1, hi[0])
         self.r0 = max(0, lo[1]); self.r1 = min(ds_h, hi[1] + 1)
         self.c0 = max(0, lo[2]); self.c1 = min(ds_w, hi[2] + 1)
 
         self.ct = np.stack([
-            pydicom.dcmread(str(hdr_in[z][1])).pixel_array[self.r0:self.r1, self.c0:self.c1]
-            for z in range(self.z0, self.z1 + 1)
+            pydicom.dcmread(str(hdr_in[z][1])).pixel_array[self.r0:self.r1:k,
+                                                           self.c0:self.c1:k]
+            for z in range(self.z0, self.z1 + 1, k)
         ], axis=0).astype(np.float32)
-        self.origin = np.array([self.z0, self.r0, self.c0], dtype=np.float64)
+        # Origin in sampling-grid units: native index / stride, so that
+        # plane()'s  idx = p / self.spacing - self.origin  hits ct[] cells.
+        self.origin = np.array([self.z0, self.r0, self.c0],
+                               dtype=np.float64) / k
 
         a = self.axis
         tmp = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
