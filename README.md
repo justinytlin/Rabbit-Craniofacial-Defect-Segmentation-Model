@@ -47,8 +47,13 @@ automatic:
   template enclosure, registration dice, defect visibility, ring coverage).
   Green means trust it; red means discard it.
 - **Results on screen**: ROI volumes, core/ring BV/TV at the chosen
-  threshold, the core-to-ring ratio (the number to report), the axial
-  preview, and a **Download results** zip.
+  threshold, the core-to-ring ratio (the number to report), Otsu + radiomic
+  features, the axial preview, and a **Download results** zip.
+- **Batches run unattended**: drop several scan folders at once (or a folder
+  containing many scans) and each becomes a queued job — jobs run one after
+  another, the Mac is kept from idle-sleeping while they run, and still-queued
+  jobs survive an app restart. Drop a batch in the evening, read the checks in
+  the morning.
 - **Nothing is destroyed by a re-run**: outputs auto-version (`…_v2`, `…_v3`)
   and ground-truth series can never be overwritten.
 - **Adjust placement** overlays draggable rings on a finished run for small
@@ -124,6 +129,32 @@ Sanity signals printed per run: `defect HU deficit` (below ~200 HU the
 defect may be fully bridged — verify placement on the preview), `ring bone
 coverage`, and the tilt. `--fit-only JSON` and `--place-threshold` (geometry
 only, default 500 HU) are available.
+
+### Extracting Otsu + radiomic features
+
+Runs automatically after every web-app job; for a series produced on the
+command line:
+
+```bash
+python 6_extract_features.py --input DICOM_DIR --roi OUT_BASE
+```
+
+Writes `<roi>_features.csv` / `.json` with ~38 features per region (core and
+ring) plus core-to-ring ratios: first-order intensity statistics, Otsu
+features (per-region Otsu and 3-class multi-Otsu thresholds, BV/TV at Otsu
+and at the fixed study threshold, mean HU of supra-threshold bone — a
+tissue-mineral-density proxy), and 3D GLCM texture (contrast, homogeneity,
+correlation, entropy, …). Implemented on numpy/scipy/scikit-image with
+IBSI-style definitions — pyradiomics does not install on current
+Python/NumPy.
+
+Extraction runs at native voxels for in vivo scans and block-averaged
+~0.06 mm voxels for ex vivo µCT (recorded in the JSON metadata). Two rules:
+compare features only between runs with the same voxel size and placement
+method, and treat the per-region Otsu threshold as a reported diagnostic —
+in an in vivo core containing air it separates air from tissue (it can land
+near −300 HU), not bone from soft tissue, which is why the fixed-threshold
+BV/TV remains the headline number.
 
 ### Stamping at an explicit pose
 

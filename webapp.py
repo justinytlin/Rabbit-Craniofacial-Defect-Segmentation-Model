@@ -355,15 +355,29 @@ def save_jobs():
 
 
 def load_jobs():
-    if JOBS_FILE.exists():
-        try:
-            data = json.loads(JOBS_FILE.read_text())
-            for jid, j in data.items():
-                if j.get('status') in ('queued', 'running'):
-                    j['status'] = 'interrupted'
-                JOBS[jid] = j
-        except (json.JSONDecodeError, OSError):
-            pass
+    """Restore job history. Jobs that were QUEUED when the server stopped are
+    re-queued automatically (they never started, so their params are still
+    valid) — an overnight batch survives a restart. Jobs that were mid-RUN
+    are marked interrupted instead: their output may be partially written,
+    so a human should re-run them deliberately."""
+    if not JOBS_FILE.exists():
+        return
+    try:
+        data = json.loads(JOBS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    requeue = []
+    for jid, j in data.items():
+        if j.get('status') == 'queued' and \
+                Path(j.get('params', {}).get('input', '')).is_dir():
+            requeue.append(jid)
+        elif j.get('status') in ('queued', 'running'):
+            j['status'] = 'interrupted'
+        JOBS[jid] = j
+    for jid in sorted(requeue, key=lambda i: JOBS[i].get('created', 0)):
+        JOB_QUEUE.put(jid)
+    if requeue:
+        print(f'Re-queued {len(requeue)} pending job(s) from the last session')
 
 
 def job_log_path(jid: str) -> Path:
@@ -397,6 +411,20 @@ def clear_previous_output(out: Path):
         png.unlink()
 
 
+def keep_awake():
+    """macOS: block idle sleep while a job runs, so an overnight queue is not
+    paused by the machine going to sleep. Returns a process to terminate when
+    the job ends, or None elsewhere."""
+    if sys.platform == 'darwin' and shutil.which('caffeinate'):
+        try:
+            return subprocess.Popen(['caffeinate', '-i'],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    return None
+
+
 def worker():
     while True:
         jid = JOB_QUEUE.get()
@@ -406,6 +434,7 @@ def worker():
         job['status'] = 'running'
         job['started'] = time.time()
         save_jobs()
+        awake = keep_awake()
         try:
             _run_job(job)
         except Exception as e:                          # noqa: BLE001
@@ -413,6 +442,9 @@ def worker():
             job['error'] = str(e)
             with open(job_log_path(jid), 'a') as fh:
                 fh.write(f'\nAPP ERROR: {e}\n')
+        finally:
+            if awake:
+                awake.terminate()
         job['finished'] = time.time()
         save_jobs()
 
@@ -472,6 +504,24 @@ def _run_job(job):
             fh.write('done.\n')
         except Exception as e:                          # noqa: BLE001
             fh.write(f'volume computation failed: {e}\n')
+
+        # Otsu + radiomic features. A failure here never fails the run —
+        # the ROI series and BV/TV above are already complete.
+        rc = run_step(job, [PYTHON, '6_extract_features.py',
+                            '--input', p['input'], '--roi', out,
+                            '--bone-threshold', thr], fh)
+        if rc == 0:
+            fjson = out.parent / (out.name + '_features.json')
+            try:
+                job.setdefault('results', {})['features'] = \
+                    json.loads(fjson.read_text())
+                job['results']['features_csv'] = str(
+                    out.parent / (out.name + '_features.csv'))
+            except (OSError, json.JSONDecodeError) as e:
+                fh.write(f'could not read features JSON: {e}\n')
+        else:
+            fh.write('feature extraction failed — see above; the ROI series '
+                     'and BV/TV are unaffected.\n')
 
     log_text = job_log_path(job['id']).read_text(errors='replace')
     job['metrics'] = parse_metrics(log_text)
@@ -769,6 +819,10 @@ def build_checks(job) -> list:
             add('Registration dice', 'fail', f'{dice:.3f} — registration failed.')
 
     r = job.get('results') or {}
+    if r.get('series') and 'features' not in r:
+        add('Feature extraction', 'warn',
+            'Otsu/radiomic feature extraction produced no output — see the '
+            'console log. The ROI series and BV/TV are unaffected.')
     if job['mode'] != 'exvivo' and r.get('bvtv_ring') is not None \
             and r['bvtv_ring'] < 0.30:
         # The 40–50% ceiling is an in vivo number (8 mm template vs ~4 mm
@@ -880,6 +934,10 @@ class Handler(BaseHTTPRequestHandler):
                     png = out.parent / (out.name + '_axial_view.png')
                     if png.exists():
                         z.write(png, png.name)
+                    for ext in ('_features.csv', '_features.json'):
+                        fp = out.parent / (out.name + ext)
+                        if fp.exists():
+                            z.write(fp, fp.name)
                 tmp.rename(zpath)
             self.send_response(200)
             self.send_header('Content-Type', 'application/zip')

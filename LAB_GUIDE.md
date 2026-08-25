@@ -40,7 +40,20 @@ rest on its own:
   name, and the hand-labeled ground-truth folders can't be overwritten at all.
 
 You can drop the whole subject folder if that's easier — the app finds the
-raw scan inside it. You can queue several scans; they run one after another.
+raw scan inside it. You can also drop **several scan folders at once** (or a
+folder containing many scans): each becomes its own queued job.
+
+## Running a batch overnight
+
+Drop everything you want processed — the jobs queue up and run **one after
+another automatically**. Once the upload bar finishes you can close the
+browser; the jobs run on the server. On a Mac the app keeps the machine from
+idle-sleeping while a job is running, and if the app is restarted, jobs that
+were still waiting in the queue pick up where they left off (a job that was
+interrupted *mid-run* is flagged instead — re-run that one yourself). Come
+back in the morning and read each run's checks as usual. Two practical notes:
+don't let the machine run out of disk (an ex vivo run writes ~10 GB), and
+keep laptops plugged in — macOS only honours the keep-awake on AC power.
 
 ## 3. Read the results
 
@@ -62,6 +75,12 @@ ROI height dilutes them.
 **c. The preview picture.** The dark defect should sit inside the cyan
 **10 mm core** circle, with the yellow/green **reference ring** on solid
 bright bone. Circles obviously off the defect → don't trust the run.
+
+**c2. The feature table.** Below the BV/TV numbers each run shows Otsu &
+radiomic features for the core and ring (mean HU, bone density, texture…),
+with the full ~38-feature set saved as `…_features.csv` next to the series
+and inside the results zip. Only compare features between runs of the same
+scan type (in vivo with in vivo, ex vivo with ex vivo).
 
 **d. Where the files went.** For archive scans, the DICOM series are written
 next to the scan (e.g. `37951_6m_output_dicom…`) ready for the existing

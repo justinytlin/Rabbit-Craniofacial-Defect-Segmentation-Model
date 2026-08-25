@@ -135,10 +135,11 @@
 
     <div class="drop" id="drop" onclick="document.getElementById('filepick').click()">
       <div class="icon">🩻</div>
-      <div class="big">Drop a scan folder here</div>
-      <div class="small">or click to choose the folder of .dcm slices.<br>
-        The app identifies the animal &amp; timepoint automatically and picks the
-        right placement method — nothing else to fill in.</div>
+      <div class="big">Drop scan folders here</div>
+      <div class="small">or click to choose folders of .dcm slices — one scan or a
+        whole batch.<br>
+        Each scan becomes a queued job; jobs run one after another, so you can
+        drop an evening's worth and leave it overnight.</div>
     </div>
     <input type="file" id="filepick" webkitdirectory multiple style="display:none">
     <div class="progress" id="progress">
@@ -306,8 +307,6 @@ async function gatherDropped(dt) {
 
 async function handleScanFiles(all) {
   $('dropError').textContent = '';
-  // Keep only .dcm files, then use the sub-folder containing the most slices —
-  // so dropping a whole subject folder still picks the raw scan, not the ROI.
   const dcm = all.filter(x => x.file.name.toLowerCase().endsWith('.dcm'));
   if (!dcm.length) { $('dropError').textContent = 'No .dcm files found in that folder.'; return; }
   const byDir = {};
@@ -315,49 +314,74 @@ async function handleScanFiles(all) {
     const dir = x.rel.slice(0, x.rel.lastIndexOf('/') + 1);
     (byDir[dir] = byDir[dir] || []).push(x);
   });
-  let files = [], dirName = '';
-  for (const [dir, list] of Object.entries(byDir))
-    if (list.length > files.length) { files = list; dirName = dir; }
-  dirName = dirName.replace(/\/$/, '').split('/').pop() || files[0].rel.split('/')[0] || 'uploaded scan';
+  // Batch mode: every sub-folder that looks like a raw scan (enough slices,
+  // not an ROI output series) becomes one queued job — so a whole night's
+  // worth of scans can be dropped in one go. If nothing passes the size bar
+  // (a small test scan), fall back to the single largest folder.
+  let scans = Object.entries(byDir)
+    .filter(([dir, list]) => list.length >= 100 && !dir.includes('output_dicom'))
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  if (!scans.length) {
+    let best = ['', []];
+    for (const ent of Object.entries(byDir))
+      if (ent[1].length > best[1].length) best = ent;
+    scans = [best];
+  }
 
   const prog = $('progress'), fill = $('progFill'), txt = $('progTxt');
-  prog.style.display = 'block'; fill.style.width = '0%';
-  txt.textContent = `Checking ${files.length} slices…`;
-  try {
-    const {upload_id} = await api('/api/upload/start', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({folder: dirName, n_files: files.length})});
-    await putFile(upload_id, files[0].file);
-    const probe = await api(`/api/upload/${upload_id}/probe`);
-    if (!probe.known) {
-      // genuinely new scan: upload everything (first file already sent)
-      txt.textContent = 'New scan — uploading…';
-      let done = 1;
-      const rest = files.slice(1);
-      const pool = Array.from({length: 6}, async () => {
-        while (rest.length) {
-          const x = rest.shift();
-          await putFile(upload_id, x.file);
-          done++;
-          fill.style.width = (100 * done / files.length).toFixed(1) + '%';
-          txt.textContent = `Uploading ${done} / ${files.length} slices…`;
-        }
-      });
-      await Promise.all(pool);
-    } else {
-      const c = probe.context || {};
-      txt.textContent = `Recognised: subject ${c.subject || '?'} · ${c.timepoint || ''} — no upload needed.`;
-      fill.style.width = '100%';
+  prog.style.display = 'block';
+  const started = [], errors = [];
+  for (let s = 0; s < scans.length; s++) {
+    const [dir, files] = scans[s];
+    const dirName = dir.replace(/\/$/, '').split('/').pop()
+      || files[0].rel.split('/')[0] || 'uploaded scan';
+    const tag = scans.length > 1 ? `[scan ${s + 1}/${scans.length}: ${dirName}] ` : '';
+    fill.style.width = '0%';
+    txt.textContent = `${tag}Checking ${files.length} slices…`;
+    try {
+      const {upload_id} = await api('/api/upload/start', {method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({folder: dirName, n_files: files.length})});
+      await putFile(upload_id, files[0].file);
+      const probe = await api(`/api/upload/${upload_id}/probe`);
+      if (!probe.known) {
+        // genuinely new scan: upload everything (first file already sent)
+        txt.textContent = `${tag}New scan — uploading…`;
+        let done = 1;
+        const rest = files.slice(1);
+        const pool = Array.from({length: 6}, async () => {
+          while (rest.length) {
+            const x = rest.shift();
+            await putFile(upload_id, x.file);
+            done++;
+            fill.style.width = (100 * done / files.length).toFixed(1) + '%';
+            txt.textContent = `${tag}Uploading ${done} / ${files.length} slices…`;
+          }
+        });
+        await Promise.all(pool);
+      } else {
+        const c = probe.context || {};
+        txt.textContent = `${tag}Recognised: subject ${c.subject || '?'} · ${c.timepoint || ''} — no upload needed.`;
+        fill.style.width = '100%';
+      }
+      const run = await api('/api/autorun', {method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({upload_id})});
+      started.push(run.label);
+      txt.textContent = `${tag}Queued: ${run.label} (${modeName(run.mode)})`;
+      if (!s) selectJob(run.id);
+      refreshJobs();
+    } catch (e) {
+      errors.push(`${dirName}: ${e.message}`);
     }
-    const run = await api('/api/autorun', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({upload_id})});
-    txt.textContent = `Started: ${run.label} (${modeName(run.mode)})`;
-    selectJob(run.id);
-    refreshJobs();
-    setTimeout(() => { prog.style.display = 'none'; }, 4000);
-  } catch (e) {
-    $('dropError').textContent = e.message;
+  }
+  if (errors.length) $('dropError').textContent = errors.join(' · ');
+  if (started.length) {
+    txt.textContent = scans.length > 1
+      ? `Queued ${started.length} scan${started.length > 1 ? 's' : ''} — they run one after another; you can close this page.`
+      : `Started: ${started[0]}`;
+    setTimeout(() => { prog.style.display = 'none'; }, 8000);
+  } else {
     prog.style.display = 'none';
   }
 }
@@ -652,6 +676,26 @@ function renderResults(j) {
       and is <b>not comparable to published BV/TV</b> — report the core-to-ring ratio, with the
       threshold (${r.bone_threshold} HU) and ROI height stated. Do not compare ratios across thresholds,
       or between network-placed and registration-placed ROIs.</div>`;
+  }
+
+  if (r && r.features && r.features.core) {
+    const F = r.features;
+    const keys = ['mean_hu', 'bone_mean_hu', 'bvtv_fixed', 'otsu_threshold_hu',
+      'bvtv_otsu', 'fraction_high', 'entropy_bits', 'glcm_contrast',
+      'glcm_homogeneity', 'glcm_entropy_bits'];
+    const fmt = x => (x == null || !isFinite(x)) ? '—'
+      : (Math.abs(x) >= 100 ? x.toFixed(0) : x.toFixed(3));
+    html += '<h2 style="margin-top:14px">Otsu &amp; radiomic features</h2>' +
+      '<table><tr><th>Feature</th><th>Core</th><th>Ring</th><th>Core : ring</th></tr>' +
+      keys.filter(k => k in F.core).map(k =>
+        `<tr><td>${k}</td><td>${fmt(F.core[k])}</td><td>${fmt(F.ring[k])}</td>
+         <td>${fmt((F.core_to_ring || {})[k])}</td></tr>`).join('') +
+      '</table>' +
+      `<div class="note">Headline subset — the full set
+       (${Object.keys(F.core).length} features × core/ring) is in
+       <code>${(r.features_csv || '').split('/').pop()}</code>, next to the series and in the
+       results zip. Extracted at ${(F.meta && F.meta.voxel_mm) ? F.meta.voxel_mm.join('×') + ' mm' : 'the working'}
+       voxels — compare features only between runs with the same voxel size and placement method.</div>`;
   }
   el.innerHTML = html;
 }
