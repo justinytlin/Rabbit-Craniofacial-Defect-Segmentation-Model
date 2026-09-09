@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Build the study-wide radiomics database.
 
-ONE sheet, one row per scan. The spreadsheet is built incrementally from the
-web app: each run added with "Add to spreadsheet" becomes (or replaces) the
-row for its scan — the row reflects exactly the series the user chose to add,
-manual `_adj` nudges included (flagged in the `manually_adjusted` column).
+ONE sheet, one row per scan. The spreadsheet is built incrementally and
+AUTOMATICALLY from the web app: every run that finishes without a FAILed
+check is added by the app the moment it completes (and a manual readjustment
+of a run re-adds it, flagged in the `manually_adjusted` column). Runs that
+error or fail a check are never added.
 
   radiomics_database/radiomics_database.xlsx
       README              what the columns mean, how to use the table
@@ -58,7 +59,9 @@ PYTHON = sys.executable
 JOBS_FILE = REPO_DIR / 'logs' / 'webapp' / 'jobs.json'
 QC_DIR = DATA_ROOT / 'segmentation_qc_2026-08-11'
 SERIES_SUFFIXES = ('_cylinder', '_ring', '_cylinder_bone', '_ring_bone')
-SKIP_DIRS = {'defect_segmentation', '.venv', 'radiomics_database'}
+# 'outputs' is the central per-run outputs folder (DATA_ROOT/outputs/...) —
+# it holds ROI series, never raw scans, and must not be walked as one.
+SKIP_DIRS = {'defect_segmentation', '.venv', 'radiomics_database', 'outputs'}
 MIN_SLICES = 300
 # Series known to be superseded (README of the 2026-08-11 QC batch).
 SUPERSEDED = {'37951_9m_v2_output_dicom'}
@@ -343,7 +346,7 @@ def series_for_scan(scan: dict):
 def placement_method(scan, name, job):
     if is_ground_truth(name):
         return 'manual annotation (ground truth)'
-    if '_adj' in name:
+    if '_adj' in name or (job and job.get('manually_adjusted')):
         return 'manual adjustment of automatic placement'
     if 'exvivo' in name or scan['scan_type'] == 'ex vivo':
         return 'ex vivo geometric placement (no network)'
@@ -448,7 +451,8 @@ def series_row(scan, ser, jobs, qc, feat_status):
         'scan_type': scan['scan_type'],
         'roi_series': ser['series_name'],
         'placement_method': placement_method(scan, ser['series_name'], job),
-        'manually_adjusted': '_adj' in ser['series_name'],
+        'manually_adjusted': ('_adj' in ser['series_name']
+                              or bool(job and job.get('manually_adjusted'))),
         'study_id': scan.get('study_id'),
         'patient_id': scan.get('patient_id'),
         'study_date': scan.get('study_date'),
@@ -551,10 +555,12 @@ README_TEXT = """Rabbit calvarial defect study — radiomics database
 Built by defect_segmentation/7_build_database.py on {built}
 
 WHAT IS IN HERE
-  database           ONE row per scan. Each row is the ROI series that was chosen for that
-                     scan: normally the run added from the web app with "Add to spreadsheet"
-                     (adding a scan again replaces its row — rows are keyed by the scanner
-                     StudyID, so any export folder of the same scan maps to the same row).
+  database           ONE row per scan. Each row is normally the scan's latest successful
+                     web-app run: the app adds every run AUTOMATICALLY when it finishes
+                     without a FAILed check (re-running or manually readjusting a scan
+                     replaces its row — rows are keyed by the scanner StudyID, so any
+                     export folder of the same scan maps to the same row). Runs that
+                     error or fail a check are never added.
                      In a full rebuild the row is the best series on disk (ground truth
                      first, then the standard automatic series; a manual _adj nudge only
                      when nothing else exists). Scans with no usable series appear as stub
@@ -585,8 +591,8 @@ KEY COLUMNS
   bone_threshold_hu  226 HU fixed study threshold behind bvtv_fixed and bone_* features.
   feature_voxel_mm   Working voxel size of the extraction (0.1 mm in vivo, 0.06 mm ex vivo).
   other_series_on_disk  Alternative ROI series that exist for the scan but are not this row.
-  added_via          'full rebuild' or the web-app run that added / refreshed the row via
-                     the run page's "Add to spreadsheet" button.
+  added_via          'full rebuild' or the web-app run that added / refreshed the row
+                     automatically when it finished.
 
 RULES (from defect_segmentation/README.md)
   * Report core_to_ring_bvtv_fixed, not absolute BV/TV — the 8 mm template is taller than the
@@ -606,8 +612,9 @@ SCANS WITHOUT FEATURES
   healed defect); needs a re-export at 0.1 mm or manual template placement.
 
 UPDATE
-  Normal path: run a scan in the web app, then click "Add to spreadsheet" on the run —
-  the run becomes (or replaces) that scan's row.
+  Normal path: run a scan in the web app — when the run finishes without a FAILed check
+  it is added to this spreadsheet automatically (the run page shows "in spreadsheet").
+  Re-running a scan, or nudging its placement, updates that scan's row in place.
   Full rebuild from disk: python defect_segmentation/7_build_database.py
   (re-extracts features only for series that have none; add --no-extract to just re-assemble)
 """
@@ -615,7 +622,9 @@ UPDATE
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--out', default=str(DATA_ROOT / 'radiomics_database'))
+    ap.add_argument('--out', default=os.environ.get(
+        'DEFECT_DB_DIR', str(DATA_ROOT / 'radiomics_database')),
+        help='database directory (env DEFECT_DB_DIR overrides the default)')
     ap.add_argument('--no-extract', action='store_true', help='assemble only; do not run 6_extract_features.py')
     ap.add_argument('--add-job', metavar='JOB_ID', action='append',
                     help='incremental: add/refresh one finished web-app run (repeatable)')
@@ -774,21 +783,31 @@ def load_existing(out_dir: Path):
 
 def scan_for_job(job: dict) -> dict:
     """Describe the scan behind a web-app run, including uploaded scans that
-    live outside the archive layout."""
+    live outside the archive layout. For uploads the user-entered metadata
+    form (job['user_meta']) is the identity of record — it is preferred over
+    the 'unknown (uploaded scan)' placeholders."""
     input_dir = Path(job['params']['input'])
     root = EXVIVO_ROOT if EXVIVO_ROOT.is_dir() and EXVIVO_ROOT in input_dir.parents else DATA_ROOT
     scan = classify_scan(input_dir, root)
     ctx = job.get('context') or {}
+    um = job.get('user_meta') or {}
     in_uploads = 'uploads' in input_dir.parts
     if in_uploads:
-        scan['treatment'] = ctx.get('group') or 'unknown (uploaded scan)'
-        scan['subject'] = ctx.get('subject') or str(job.get('label') or input_dir.parent.name)
-        scan['note'] = (f'uploaded through the web app (run {job["id"]}); not in the study archive'
-                        + (f' — {scan["note"]}' if scan['note'] else ''))
-        if ctx.get('timepoint') and not scan['timepoint']:
-            scan['timepoint'] = ctx['timepoint']
-            m = re.match(r'(\d+)', ctx['timepoint'])
+        scan['treatment'] = (um.get('treatment') or ctx.get('group')
+                             or 'unknown (uploaded scan)')
+        scan['subject'] = str(um.get('sample') or ctx.get('subject')
+                              or job.get('label') or input_dir.parent.name)
+        note = f'uploaded through the web app (run {job["id"]}); not in the study archive'
+        if um.get('notes'):
+            note += f' — user notes: {um["notes"]}'
+        scan['note'] = note + (f' — {scan["note"]}' if scan['note'] else '')
+        tp = um.get('timepoint') or ctx.get('timepoint')
+        if tp and not scan['timepoint']:
+            scan['timepoint'] = tp
+            m = re.match(r'(\d+)', str(tp))
             scan['timepoint_months'] = int(m.group(1)) if m else None
+        elif um.get('timepoint_months') and not scan['timepoint_months']:
+            scan['timepoint_months'] = um['timepoint_months']
     else:
         if ctx.get('group') and scan['treatment'] in (None, 'unknown'):
             scan['treatment'] = ctx['group']
@@ -807,8 +826,9 @@ def add_job(job_id: str, out_dir: Path) -> dict:
     job = jobs_raw.get(job_id)
     if not job:
         raise SystemExit(f'no such run: {job_id}')
-    if not str(job.get('status', '')).startswith('done'):
-        raise SystemExit(f'run {job_id} is {job.get("status")} — only finished runs can be added')
+    if job.get('status') not in ('done', 'done_warn'):
+        raise SystemExit(f'run {job_id} is {job.get("status")} — only runs that '
+                         'finished without a FAILed check can be added')
     jobs = load_jobs()
     qc = load_qc()
     out_dir.mkdir(parents=True, exist_ok=True)

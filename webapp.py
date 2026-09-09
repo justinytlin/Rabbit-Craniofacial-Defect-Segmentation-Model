@@ -62,8 +62,18 @@ SCAN_ROOTS = list(ALLOWED_ROOTS)
 
 UPLOADS_DIR = APP_DIR / 'uploads'
 INDEX_FILE = APP_DIR / 'scan_index.json'
-DATABASE_DIR = DATA_ROOT / 'radiomics_database'       # study-wide spreadsheet (7_build_database.py)
+# Study-wide spreadsheet (7_build_database.py). Overridable for testing.
+DATABASE_DIR = Path(os.environ.get('DEFECT_DB_DIR')
+                    or (DATA_ROOT / 'radiomics_database'))
 DATABASE_LOCK = threading.Lock()
+
+# All new runs write their series into one central folder, one subfolder per
+# scan: DATA_ROOT/outputs/<sample>_<timepoint>_<treatment>/. Never indexed as
+# raw scans (see build_scan_index / 7_build_database.find_scans).
+OUTPUTS_DIR = DATA_ROOT / 'outputs'
+
+# Treatment groups offered in the new-scan metadata form.
+TREATMENT_GROUPS = ['Defect', 'Defect +PDLLA', 'MC', 'MC+PDLLA']
 
 JOBS = {}          # id -> job dict
 JOB_LOCK = threading.Lock()
@@ -111,6 +121,46 @@ def is_roi_series_name(name: str) -> bool:
 def is_ground_truth_name(name: str) -> bool:
     """The 12 hand-labeled GT series are named exactly <digits>_output_dicom."""
     return re.fullmatch(r'\d+_output_dicom', name) is not None
+
+
+def sanitize_component(s: str) -> str:
+    """Make a string safe as a single folder-name component: spaces to _,
+    slashes and other unsafe characters stripped."""
+    s = str(s or '').strip().replace('/', '').replace('\\', '')
+    s = re.sub(r'\s+', '_', s)
+    s = re.sub(r'[^A-Za-z0-9_+.\-]', '', s)
+    return s.strip('._') or 'unknown'
+
+
+def outputs_folder(sample, timepoint, treatment) -> Path:
+    """Central per-scan outputs folder: outputs/<sample>_<tp>_<treatment>/."""
+    parts = [sanitize_component(x) for x in (sample, timepoint, treatment) if x]
+    return OUTPUTS_DIR / '_'.join(parts or ['unknown'])
+
+
+def clear_outputs_folder(folder: Path):
+    """A re-run of the same scan REPLACES the contents of its outputs folder:
+    remove earlier series dirs / previews / feature files so nothing stale
+    survives underneath. Refuses to touch anything outside outputs/ or any
+    ground-truth-named series (defence in depth — GT never lives here)."""
+    folder = folder.resolve()
+    if OUTPUTS_DIR.resolve() not in folder.parents:
+        raise RuntimeError(f'refusing to clear {folder} — not under {OUTPUTS_DIR}')
+    if not folder.is_dir():
+        return
+    for e in os.scandir(folder):
+        if e.name.startswith('.'):
+            continue                      # AppleDouble etc. — leave alone
+        p = Path(e.path)
+        if e.is_dir():
+            if is_ground_truth_name(e.name):
+                raise RuntimeError(f'{e.name} matches the ground-truth naming '
+                                   'pattern — refusing to delete it')
+            if 'output_dicom' in e.name:
+                shutil.rmtree(p)
+        elif e.name.endswith(('_axial_view.png', '_features.csv',
+                              '_features.json')):
+            p.unlink()
 
 
 # ─────────────────────────────────────────────────────────────── scan index
@@ -184,6 +234,7 @@ def build_scan_index():
                 rel_depth = len(Path(dirpath).parts) - len(root.parts)
                 dirnames[:] = [d for d in dirnames if not d.startswith('.')
                                and d != 'defect_segmentation'
+                               and d != 'outputs'      # central outputs folder
                                and 'output_dicom' not in d]
                 if rel_depth >= 5:
                     dirnames[:] = []
@@ -242,19 +293,15 @@ def detect_context(input_dir: Path) -> dict:
                 info['subject'] = p
                 break
 
-    # Subject directory = where outputs conventionally live.
-    if info['subject'] and info['subject'] in parts:
-        subj_dir = Path(*parts[:parts.index(info['subject']) + 1])
-    else:
-        subj_dir = input_dir.parent
-
-    # Suggested output name follows the existing convention
-    # (37951_6m_output_dicom); at 3 months add _pred so the hand-labeled
-    # ground truth 37951_output_dicom can never be collided with.
+    # Suggested output: the central outputs folder for this scan
+    # (outputs/<sample>_<tp>_<treatment>/<sample>_<tp>_output_dicom). The
+    # series name always carries the timepoint, so it can never collide with
+    # the hand-labeled ground truth (<digits>_output_dicom).
     subj = info['subject'] or 'SUBJECT'
-    tp = info['tp_short'] or 'tp'
-    name = f'{subj}_{tp}_pred_output_dicom' if info['is_3m'] else f'{subj}_{tp}_output_dicom'
-    info['suggested_output'] = str(subj_dir / name)
+    tp = info['tp_short'] or 'unknown'
+    folder = outputs_folder(subj, tp, info['group'])
+    info['suggested_output'] = str(
+        folder / f'{sanitize_component(subj)}_{tp}_output_dicom')
 
     # Reference scan+ROI for registration: same group, 3 MONTH, same subject.
     if info['group'] and info['subject'] and month_idx is not None and not info['is_3m']:
@@ -338,19 +385,6 @@ def build_adjust_view(job) -> dict:
                 'radii_mm': [5.0, 7.0, 9.0]}
         meta_f.write_text(json.dumps(meta))
         return meta
-
-
-def auto_version_output(base: Path) -> Path:
-    """Return base, or base_v2/_v3… if any series of base already exists."""
-    def taken(p: Path):
-        return any((p.parent / (p.name + s)).exists() for s in SERIES_SUFFIXES)
-    if not taken(base):
-        return base
-    for i in range(2, 100):
-        cand = base.parent / f'{base.name}_v{i}'
-        if not taken(cand):
-            return cand
-    raise RuntimeError('ran out of _v suffixes')
 
 
 # ──────────────────────────────────────────────────────────── job execution
@@ -456,18 +490,52 @@ def worker():
                 awake.terminate()
         job['finished'] = time.time()
         save_jobs()
+        # Every successful run goes into the study spreadsheet automatically.
+        # Runs whose checks include a FAIL (done_fail) and errored runs are
+        # never added; a failure to add never changes the run's own status.
+        if job.get('status') in ('done', 'done_warn'):
+            try:
+                add_job_to_database(job)
+                job.pop('database_error', None)
+            except Exception as e:                      # noqa: BLE001
+                job['database_error'] = str(e)
+                with open(job_log_path(jid), 'a') as fh:
+                    fh.write(f'\nCould not add to the spreadsheet: {e}\n')
+        elif job.get('status') == 'done_fail':
+            with open(job_log_path(jid), 'a') as fh:
+                fh.write('\nNot added to the spreadsheet: a sanity check '
+                         'FAILED — fix or re-run first.\n')
+        save_jobs()
 
 
 def _run_job(job):
     p = job['params']
     out = Path(p['output'])
     thr = str(p.get('bone_threshold', DEFAULT_BONE_THRESHOLD))
+    adjust_pose = job.pop('pending_adjust_pose', None)
     with open(job_log_path(job['id']), 'a') as fh:
-        if p.get('overwrite'):
+        try:
+            in_outputs = OUTPUTS_DIR.resolve() in out.resolve().parents
+        except OSError:
+            in_outputs = False
+        if in_outputs:
+            # Central outputs folder: a re-run REPLACES the folder contents.
+            out.parent.mkdir(parents=True, exist_ok=True)
+            clear_outputs_folder(out.parent)
+            fh.write(f'Outputs folder: {out.parent} (previous series replaced)\n')
+        elif p.get('overwrite') or adjust_pose:
             clear_previous_output(out)
             fh.write(f'Cleared previous series for {out.name}\n')
 
-        if job['mode'] == 'later_reg':
+        if adjust_pose:
+            # Manual readjustment of THIS run: re-stamp the template at the
+            # nudged pose into the same series, replacing the files in place.
+            rc = run_step(job, [PYTHON, 'stamp_roi.py', '--input', p['input'],
+                                '--output', out, '--pose', adjust_pose,
+                                '--bone-refine', '--bone-threshold', thr], fh)
+            if rc != 0:
+                raise RuntimeError(f're-stamping exited with code {rc}')
+        elif job['mode'] == 'later_reg':
             fit_json = APP_DIR / f'{job["id"]}_fit.json'
             rc = run_step(job, [PYTHON, '3_inference.py',
                                 '--input', p['input'], '--output', out,
@@ -541,6 +609,15 @@ def _run_job(job):
     preview = out.parent / (out.name + '_axial_view.png')
     if preview.exists():
         job['preview'] = str(preview)
+    if adjust_pose:
+        # The cached reslice/geometry describe the pre-nudge pose — drop them
+        # so the next "Adjust placement" rebuilds from the new series. A stale
+        # results zip is dropped for the same reason.
+        for f in (APP_DIR / 'adjust' / f'{job["id"]}.json',
+                  APP_DIR / 'adjust' / f'{job["id"]}.png',
+                  APP_DIR / 'zips' / f'{job["id"]}.zip'):
+            if f.exists():
+                f.unlink()
 
 
 # ─────────────────────────────────────────────── metrics, checks, BV/TV
@@ -664,7 +741,32 @@ def build_checks(job) -> list:
     def add(name, status, detail):
         checks.append({'name': name, 'status': status, 'detail': detail})
 
-    if job['mode'] == 'manual':
+    if job.get('user_meta'):
+        um = job['user_meta']
+        add('Scan identity', 'pass',
+            'Entered by hand when the scan was dropped in: sample '
+            f'{um.get("sample")}, group {um.get("treatment") or "?"}, '
+            f'timepoint {um.get("timepoint") or "unknown"}. Not verified '
+            'against the study archive.')
+    if job.get('manually_adjusted') and job['mode'] != 'manual':
+        off = job.get('manual_offset_mm')
+        add('Placement method', 'warn',
+            f'MANUALLY ADJUSTED — this run was re-stamped {off} mm off its '
+            'automatic placement. Flag this series as manually placed in any '
+            'analysis; never mix it with automatically placed ROIs in a '
+            'comparison.')
+        if off is not None and off > 2.5:
+            add('Offset size', 'warn',
+                f'{off} mm is a large manual move. If the automatic run was this '
+                'far off, prefer re-running (or registration) over dragging.')
+        if job['mode'] == '3m':
+            add('3-month caution', 'warn',
+                'This is a 3-month scan, where the automatic fit matches the '
+                'annotation protocol to ~0.21 mm. A validated study finding: '
+                'visually "better-centred" placements were WORSE on 11 of 12 '
+                'ground-truth subjects. Re-run the scan to restore the '
+                'automatic placement.')
+    elif job['mode'] == 'manual':
         off = job.get('manual_offset_mm')
         add('Placement method', 'warn',
             f'MANUALLY ADJUSTED — nudged {off} mm off the automatic placement '
@@ -891,6 +993,9 @@ def add_job_to_database(job) -> dict:
     job['database'] = {'added': time.time(), 'roi_series': result.get('roi_series'),
                        'replaced': result.get('replaced'),
                        'manually_adjusted': result.get('manually_adjusted'),
+                       'treatment': result.get('treatment'),
+                       'subject': result.get('subject'),
+                       'timepoint_months': result.get('timepoint_months'),
                        'n_scans': result.get('n_scans'), 'xlsx': result.get('xlsx')}
     save_jobs()
     return result
@@ -939,7 +1044,16 @@ class Handler(BaseHTTPRequestHandler):
             sid = read_study_id(f)
             known = SCAN_INDEX.get(sid) if sid else None
             resp = {'study_id': sid, 'known': bool(known),
-                    'index': INDEX_STATE['status']}
+                    'index': INDEX_STATE['status'],
+                    'treatment_groups': TREATMENT_GROUPS}
+            try:
+                import pydicom
+                ds = pydicom.dcmread(str(f), stop_before_pixels=True)
+                resp['patient_name'] = str(getattr(ds, 'PatientName', '') or '')
+                resp['patient_id'] = str(getattr(ds, 'PatientID', '') or '')
+            except Exception:                           # noqa: BLE001
+                pass
+            resp['exvivo_guess'] = scan_is_exvivo(scan_dir)
             if known:
                 resp['scan_path'] = known
                 ctx = detect_context(Path(known))
@@ -1038,9 +1152,10 @@ class Handler(BaseHTTPRequestHandler):
             if scan_is_exvivo(p):
                 ctx['exvivo'] = True
                 pid = read_patient_id(first_dcm(p))
-                base = '_'.join(x for x in (pid, p.name) if x) \
-                    + '_exvivo_output_dicom'
-                ctx['suggested_output'] = str(p.parent / base)
+                sample = '_'.join(x for x in (pid, p.name) if x)
+                folder = outputs_folder(sample, 'exvivo', None)
+                ctx['suggested_output'] = str(
+                    folder / f'{sanitize_component(sample)}_exvivo_output_dicom')
             self._json(ctx)
 
         elif route == '/api/database':
@@ -1058,6 +1173,7 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 return self._err('no such job', 404)
             out = dict(job)
+            out['display_status'] = display_status(job.get('status'))
             lp = job_log_path(jid)
             frm = int(q.get('log_from', 0))
             if lp.exists():
@@ -1121,8 +1237,9 @@ class Handler(BaseHTTPRequestHandler):
             job = JOBS.get(jid)
             if not job:
                 return self._err('no such job', 404)
-            if not str(job.get('status', '')).startswith('done'):
-                return self._err('only a finished run can be added to the spreadsheet')
+            if job.get('status') not in ('done', 'done_warn'):
+                return self._err('only a run that passed its checks can be '
+                                 'added to the spreadsheet')
             try:
                 result = add_job_to_database(job)
             except (RuntimeError, subprocess.TimeoutExpired) as e:
@@ -1206,26 +1323,58 @@ class Handler(BaseHTTPRequestHandler):
 
         ctx = detect_context(input_dir)
         in_uploads = UPLOADS_DIR in input_dir.parents
-        if scan_is_exvivo(input_dir):
+        user_meta = None
+        is_new_upload = in_uploads      # unrecognised scan uploaded in full
+        if is_new_upload:
+            # Unrecognised scan: the metadata form is REQUIRED (sample at
+            # minimum) — it names the outputs folder and fills the
+            # spreadsheet row. Recognised archive scans never reach here.
+            um = p.get('user_meta') or {}
+            sample = sanitize_component(um.get('sample') or '')
+            if not um or sample in ('', 'unknown'):
+                return self._err('this scan is not in the study archive — '
+                                 'fill in the scan details first (a sample '
+                                 'name/ID is required)')
+            tp_raw = str(um.get('timepoint') or '').strip().lower()
+            m = re.match(r'(\d+)', tp_raw)
+            tp_months = int(m.group(1)) if m else None
+            if tp_months not in (None, 3, 6, 9):
+                return self._err('timepoint must be 3, 6, 9 or unknown')
+            user_meta = {
+                'sample': str(um.get('sample')).strip(),
+                'treatment': str(um.get('treatment') or '').strip() or None,
+                'timepoint': f'{tp_months} MONTH' if tp_months else None,
+                'timepoint_months': tp_months,
+                'scan_type': str(um.get('scan_type') or 'auto').strip(),
+                'notes': str(um.get('notes') or '').strip() or None}
+
+        if scan_is_exvivo(input_dir) or \
+                (user_meta and user_meta['scan_type'].replace(' ', '') == 'exvivo'):
             # Ex vivo specimen: geometric placement, no timepoint/reference.
             mode = 'exvivo'
             placement_note += ' — ex vivo specimen'
             pid = read_patient_id(first_dcm(input_dir))
-            base = '_'.join(x for x in (pid, input_dir.name) if x) \
-                + '_exvivo_output_dicom'
-            if in_uploads:
-                output = input_dir.parent / base
+            if user_meta:
+                sample = sanitize_component(user_meta['sample'])
+                folder = outputs_folder(sample, 'exvivo',
+                                        user_meta['treatment'])
+                base = f'{sample}_exvivo_output_dicom'
             else:
-                output = auto_version_output(input_dir.parent / base)
-            label = base
-        elif in_uploads:
-            # Unknown uploaded scan: outputs live in the upload folder, the
-            # timepoint is unknown, and no reference can be located.
-            mode = 'later_raw'
-            sid = read_study_id(first_dcm(input_dir))
-            base = f'{sid or "scan"}_output_dicom_pred'
-            output = input_dir.parent / base
-            label = label_hint or base
+                sample = '_'.join(x for x in (pid, input_dir.name) if x)
+                folder = outputs_folder(sample, 'exvivo', None)
+                base = f'{sanitize_component(sample)}_exvivo_output_dicom'
+            output = folder / base
+        elif is_new_upload:
+            # Uploaded scan with user-entered metadata. 3-month scans get the
+            # network directly; anything else (or an unknown timepoint) is raw
+            # network placement, flagged — registration needs an archived
+            # 3-month reference which an uploaded scan does not have.
+            sample = sanitize_component(user_meta['sample'])
+            tp_short = f'{user_meta["timepoint_months"]}m' \
+                if user_meta['timepoint_months'] else 'unknown'
+            mode = '3m' if user_meta['timepoint_months'] == 3 else 'later_raw'
+            folder = outputs_folder(sample, tp_short, user_meta['treatment'])
+            output = folder / f'{sample}_{tp_short}_output_dicom'
         else:
             if ctx['is_3m']:
                 mode = '3m'
@@ -1233,25 +1382,41 @@ class Handler(BaseHTTPRequestHandler):
                 mode = 'later_reg'
             else:
                 mode = 'later_raw'
-            output = auto_version_output(Path(ctx['suggested_output']))
-            label = output.name
+            subj = ctx.get('subject') or input_dir.name
+            tp_short = ctx.get('tp_short') or 'unknown'
+            folder = outputs_folder(subj, tp_short, ctx.get('group'))
+            output = folder / f'{sanitize_component(subj)}_{tp_short}_output_dicom'
+        label = output.parent.name
+
+        if is_ground_truth_name(output.name):            # defence in depth
+            return self._err('derived output name matches the ground-truth '
+                             'pattern — give the scan a different sample name')
+
+        context = {k: ctx.get(k) for k in ('subject', 'group', 'timepoint')}
+        if user_meta:
+            context = {'subject': user_meta['sample'],
+                       'group': user_meta['treatment'],
+                       'timepoint': user_meta['timepoint']}
 
         jid = uuid.uuid4().hex[:12]
         job = {'id': jid, 'created': time.time(), 'status': 'queued',
                'mode': mode, 'label': label,
                'auto': True, 'placement_note': placement_note,
-               'context': {k: ctx.get(k) for k in ('subject', 'group', 'timepoint')},
+               'context': context,
                'params': {'input': str(input_dir), 'output': str(output),
                           'ref_input': ctx.get('ref_input'),
                           'ref_roi': ctx.get('ref_roi'),
                           'bone_threshold': DEFAULT_BONE_THRESHOLD,
                           'wide_search': False, 'overwrite': False}}
+        if user_meta:
+            job['user_meta'] = user_meta
         APP_DIR.mkdir(parents=True, exist_ok=True)
         job_log_path(jid).write_text(
             f'Auto run — {placement_note}\n'
             f'  scan      : {input_dir}\n'
             f'  placement : {mode}\n'
-            f'  output    : {output}\n')
+            f'  output    : {output}\n'
+            + (f'  entered   : {json.dumps(user_meta)}\n' if user_meta else ''))
         with JOB_LOCK:
             JOBS[jid] = job
         save_jobs()
@@ -1260,13 +1425,19 @@ class Handler(BaseHTTPRequestHandler):
                     'context': job['context'],
                     'placement_note': placement_note})
 
-    def _adjust(self, parent_id, p):
-        """Apply a manual in-plane nudge: re-stamp the template at the shifted
-        centre as a NEW flagged series; the automatic run is never modified."""
-        parent = JOBS.get(parent_id)
-        if not parent:
+    def _adjust(self, jid, p):
+        """Apply a manual in-plane nudge to a finished run — IN PLACE.
+        The run's own series are re-stamped at the shifted centre (replacing
+        the files in the same outputs folder), features are re-extracted, and
+        the same job record is updated: the Runs list keeps ONE entry, marked
+        as readjusted. The previous pose is kept in logs/webapp/adjust/ so an
+        undo remains possible later."""
+        job = JOBS.get(jid)
+        if not job:
             return self._err('no such job', 404)
-        meta_f = APP_DIR / 'adjust' / f'{parent_id}.json'
+        if not str(job.get('status', '')).startswith('done'):
+            return self._err('only a finished run can be adjusted')
+        meta_f = APP_DIR / 'adjust' / f'{jid}.json'
         if not meta_f.exists():
             return self._err('open the adjust view first')
         try:
@@ -1282,35 +1453,40 @@ class Handler(BaseHTTPRequestHandler):
         meta = json.loads(meta_f.read_text())
         c = [meta['center_mm'][i] + du * meta['e1'][i] + dv * meta['e2'][i]
              for i in range(3)]
-        parent_out = Path(parent['params']['output'])
-        output = auto_version_output(parent_out.parent / (parent_out.name + '_adj'))
-        pose_f = APP_DIR / 'adjust' / f'{parent_id}_{output.name}_pose.json'
+
+        # Keep the pose being replaced, for a later undo.
+        n_prev = len(job.get('adjust_history') or [])
+        prev_f = APP_DIR / 'adjust' / f'{jid}_prev{n_prev + 1}_pose.json'
+        prev_f.write_text(json.dumps({
+            'center_mm': meta['center_mm'], 'axis': meta['axis'],
+            'note': f'pose of {job["label"]} before manual nudge '
+                    f'#{n_prev + 1}'}))
+        pose_f = APP_DIR / 'adjust' / f'{jid}_pose.json'
         pose_f.write_text(json.dumps({
             'center_mm': c, 'axis': meta['axis'],
             'note': f'manual nudge {offset:.2f} mm (du={du:+.2f}, dv={dv:+.2f}) '
-                    f'from {parent["label"]}'}))
+                    f'of {job["label"]}'}))
 
-        jid = uuid.uuid4().hex[:12]
-        job = {'id': jid, 'created': time.time(), 'status': 'queued',
-               'mode': 'manual', 'label': output.name,
-               'parent': parent_id, 'manual_offset_mm': round(offset, 2),
-               'parent_mode': parent['mode'],
-               'context': parent.get('context'),
-               'placement_note': f'manual nudge of {parent["label"]}',
-               'params': {'input': parent['params']['input'],
-                          'output': str(output), 'pose': str(pose_f),
-                          'ref_input': None, 'ref_roi': None,
-                          'bone_threshold': parent['params'].get(
-                              'bone_threshold', DEFAULT_BONE_THRESHOLD),
-                          'wide_search': False, 'overwrite': False}}
-        job_log_path(jid).write_text(
-            f'Manual adjustment of {parent["label"]}: '
-            f'du={du:+.2f} mm, dv={dv:+.2f} mm (|Δ|={offset:.2f} mm)\n')
         with JOB_LOCK:
-            JOBS[jid] = job
+            job['status'] = 'queued'
+            job['manually_adjusted'] = True
+            job['manual_offset_mm'] = round(offset, 2)
+            job.setdefault('adjust_history', []).append({
+                'time': time.time(), 'offset_mm': round(offset, 2),
+                'du_mm': round(du, 2), 'dv_mm': round(dv, 2),
+                'previous_pose': str(prev_f)})
+            job['pending_adjust_pose'] = str(pose_f)
+            job.pop('database_error', None)
+            for k in ('results', 'checks', 'metrics', 'preview'):
+                job.pop(k, None)
+        with open(job_log_path(jid), 'a') as fh:
+            fh.write(f'\n===== Manual readjustment of {job["label"]}: '
+                     f'du={du:+.2f} mm, dv={dv:+.2f} mm (|Δ|={offset:.2f} mm) '
+                     '— re-stamping the same series in place =====\n')
         save_jobs()
         JOB_QUEUE.put(jid)
-        self._json({'id': jid, 'label': output.name, 'offset_mm': round(offset, 2)})
+        self._json({'id': jid, 'label': job['label'],
+                    'offset_mm': round(offset, 2)})
 
     def _start_job(self, p):
         mode = p.get('mode')
@@ -1370,9 +1546,21 @@ class Handler(BaseHTTPRequestHandler):
         self._json({'id': jid})
 
 
+def display_status(status: str) -> str:
+    """User-visible badge taxonomy: queued / running / passed / error.
+    Check details (warnings included) stay visible in the run detail page and
+    flow into the spreadsheet's qc_overall / qc_flags — only the badge
+    taxonomy shrinks. A run with a FAILed check maps to error."""
+    return {'queued': 'queued', 'running': 'running',
+            'done': 'passed', 'done_warn': 'passed'}.get(status, 'error')
+
+
 def _job_summary(j):
-    return {k: j.get(k) for k in
-            ('id', 'created', 'started', 'finished', 'status', 'mode', 'label')}
+    s = {k: j.get(k) for k in
+         ('id', 'created', 'started', 'finished', 'status', 'mode', 'label',
+          'manually_adjusted')}
+    s['display_status'] = display_status(j.get('status'))
+    return s
 
 
 # ────────────────────────────────────────────────────────────────────── main

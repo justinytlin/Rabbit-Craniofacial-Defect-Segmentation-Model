@@ -35,7 +35,10 @@ Double-click **`Launch Defect Segmenter.command`** (or run
 automatic:
 
 - **The scan is recognised from its own DICOM headers.** Scans already in
-  the study archive skip the upload entirely.
+  the study archive skip the upload entirely. A scan the app does NOT
+  recognise brings up a short form first — sample name/ID, treatment group,
+  timepoint, scan type, notes — which names the results folder and fills the
+  scan's spreadsheet row.
 - **The placement mode is chosen for you:**
   - *3-month in vivo* → direct network placement (the training timepoint).
   - *Any later in vivo timepoint* → registration from the animal's 3-month
@@ -45,23 +48,36 @@ automatic:
   - *Unrecognised scan* → network placement, flagged with a caveat.
 - **Every run is sanity-checked** with mode-appropriate checks (axis tilt,
   template enclosure, registration dice, defect visibility, ring coverage).
-  Green means trust it; red means discard it.
+  A run shows exactly one of four statuses: **queued**, **running**,
+  **passed**, or **error** — a run whose checks include a failure shows as
+  error. The full check details (warnings included) stay on the run page.
 - **Results on screen**: ROI volumes, core/ring BV/TV at the chosen
   threshold, the core-to-ring ratio (the number to report), Otsu + radiomic
-  features, the axial preview, a **Download results** zip, and an **Add to
-  spreadsheet** button that appends the run to the study-wide radiomics
-  database (`radiomics_database/radiomics_database.xlsx`).
+  features, the axial preview, and a **Download results** zip.
+- **The study spreadsheet updates itself**: every run that passes is added
+  to the study-wide radiomics database
+  (`radiomics_database/radiomics_database.xlsx`) the moment it finishes —
+  one row per scan, re-runs and nudges replace the row. Runs that error or
+  fail a check are never added.
+- **All outputs land in one place**: `outputs/<sample>_<timepoint>_<treatment>/`
+  next to this repo (e.g. `outputs/37952_3m_Defect/`), holding the five DICOM
+  series, the axial preview and the feature files for that scan.
 - **Batches run unattended**: drop several scan folders at once (or a folder
   containing many scans) and each becomes a queued job — jobs run one after
   another, the Mac is kept from idle-sleeping while they run, and still-queued
   jobs survive an app restart. Drop a batch in the evening, read the checks in
   the morning.
-- **Nothing is destroyed by a re-run**: outputs auto-version (`…_v2`, `…_v3`)
-  and ground-truth series can never be overwritten.
+- **A re-run replaces its own outputs folder** (and its spreadsheet row) —
+  no `_v2` clutter. The hand-labeled ground-truth series in the archive can
+  never be overwritten, and nothing under `outputs/` is ever mistaken for a
+  raw scan.
 - **Adjust placement** overlays draggable rings on a finished run for small
-  manual nudges (≤ 6 mm). The nudge writes a NEW `…_adj` series permanently
-  flagged as manually placed; the automatic result is never modified. Avoid
-  nudging 3-month runs — the automatic fit is validated to ~0.2 mm there.
+  manual nudges (≤ 6 mm). Applying a nudge updates THAT run in place — the
+  series is re-stamped at the new position, features re-extracted, and the
+  scan's spreadsheet row refreshed — and the run is permanently flagged as
+  readjusted (the replaced pose is kept under `logs/webapp/adjust/`, and
+  re-running the scan restores the automatic placement). Avoid nudging
+  3-month runs — the automatic fit is validated to ~0.2 mm there.
 
 The **Advanced** panel keeps the fully manual run (explicit mode, reference,
 threshold, overwrite). Run history and logs persist in `logs/webapp/`. To
@@ -172,17 +188,21 @@ carries treatment, subject, timepoint, scan type, placement method (with a
 or the 2026-08-11 batch QC), the template pose, and `core_*`, `ring_*`,
 `core_to_ring_*` columns for all 113 features. Rows are keyed by scanner
 StudyID, so re-adding a scan — from any export folder — replaces its row
-instead of duplicating it. The normal path is incremental: every finished
-web-app run shows an **Add to spreadsheet** button, and the row reflects
-exactly the run the user added (equivalent to
-`python 7_build_database.py --add-job JOB_ID`). The full rebuild above
-instead picks the best series on disk per scan (ground truth first; a manual
-`_adj` series only when nothing else exists) and writes stub rows for scans
-with no usable series.
+instead of duplicating it. The normal path is incremental and automatic: the
+web app adds every run that finishes without a failed check the moment it
+completes (equivalent to `python 7_build_database.py --add-job JOB_ID`);
+errored or check-failed runs are never added, and a manual readjustment
+re-adds its run automatically with `manually_adjusted` set. The database
+directory can be overridden with the `DEFECT_DB_DIR` environment variable
+(default `../radiomics_database`). The full rebuild above instead picks the
+best series on disk per scan (ground truth first; a manual `_adj` series
+only when nothing else exists) and writes stub rows for scans with no usable
+series.
 
-A full rebuild re-scans the whole archive; it does not include scans that
-were uploaded through the app rather than archived — add those from their
-run pages.
+A full rebuild re-scans the whole archive (skipping the central `outputs/`
+folder, which holds ROI series, never raw scans); it does not include scans
+that were uploaded through the app rather than archived — those enter the
+spreadsheet through their automatic web-app runs.
 
 ### Stamping at an explicit pose
 

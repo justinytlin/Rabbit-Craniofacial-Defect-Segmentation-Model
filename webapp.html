@@ -71,11 +71,13 @@
   .status { font-size: 11px; font-weight: 700; border-radius: 999px; padding: 2px 9px;
             text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
   .st-running { background: #dbeafe; color: #1d4ed8; }
-  .st-queued, .st-interrupted { background: var(--chip); color: var(--muted); }
-  .st-done { background: #d1fae5; color: var(--pass); }
-  .st-done_warn { background: #fef3c7; color: var(--warn); }
-  .st-done_fail, .st-failed { background: #fee2e2; color: var(--fail); }
-  .st-cancelled { background: var(--chip); color: var(--muted); }
+  .st-queued { background: var(--chip); color: var(--muted); }
+  .st-passed { background: #d1fae5; color: var(--pass); }
+  .st-error { background: #fee2e2; color: var(--fail); }
+  .st-error.muted { background: var(--chip); color: var(--muted); }
+  .adjbadge { font-size: 10px; font-weight: 700; border-radius: 999px; padding: 2px 8px;
+              background: #fef3c7; color: var(--warn); text-transform: uppercase;
+              letter-spacing: .04em; white-space: nowrap; }
   /* detail */
   .check { display: flex; gap: 9px; margin: 7px 0; font-size: 13px; }
   .check .ico { font-weight: 800; width: 16px; text-align: center; }
@@ -188,7 +190,7 @@
       </div>
     </fieldset>
 
-    <label>Output series name (written next to the scan)</label>
+    <label>Output series path (suggested: the central <code>outputs/</code> folder)</label>
     <input type="text" id="output">
 
     <div class="inline">
@@ -210,12 +212,11 @@
       <div id="jobList"><div class="empty">No runs yet — drop a scan folder on the left to start.</div></div>
     </div>
     <div class="card" id="detailCard" style="display:none; margin-top:18px">
-      <h2 style="display:flex; justify-content:space-between; gap:8px">
-        <span id="dTitle"></span>
+      <h2 style="display:flex; justify-content:space-between; gap:8px; align-items:center">
+        <span id="dTitle" style="display:flex; gap:8px; align-items:center"></span>
         <span>
           <button id="adjBtn" style="display:none" onclick="openAdjust()">Adjust placement</button>
           <a id="dlBtn" style="display:none" href="#"><button>Download results</button></a>
-          <button id="dbBtn" class="primary" style="display:none; width:auto; margin:0" onclick="addToDatabase()">Add to spreadsheet</button>
           <button id="cancelBtn" style="display:none" onclick="cancelJob()">Cancel</button>
         </span>
       </h2>
@@ -248,6 +249,55 @@
       <button onclick="browseUp()">Up</button>
       <button onclick="closeBrowser()">Cancel</button>
       <button class="primary" style="width:auto; margin:0" onclick="pickCurrent()">Select this folder</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ── new-scan metadata modal (unrecognised uploads only) ── -->
+<div class="overlay" id="metaOverlay">
+  <div class="modal" style="width:min(460px,92vw)">
+    <header style="border-bottom:1px solid var(--line)">
+      <div>
+        <h1 style="font-size:14px">New scan — tell the app what this is</h1>
+        <div class="path" id="metaFolder"></div>
+      </div>
+    </header>
+    <div style="padding:6px 16px 12px; overflow:auto">
+      <div class="note">This scan is not in the study archive, so the app can't
+        identify it. What you enter here names the results folder and fills the
+        scan's spreadsheet row.</div>
+      <label>Sample name / ID <span style="color:var(--fail)">(required)</span></label>
+      <input type="text" id="metaSample" placeholder="e.g. 37951">
+      <label>Treatment group</label>
+      <select id="metaTreatment" style="width:100%; padding:7px 9px; border:1px solid var(--line); border-radius:7px; font-size:13px; background:#fbfcfd">
+        <option value="">unknown</option>
+        <option>Defect</option>
+        <option>Defect +PDLLA</option>
+        <option>MC</option>
+        <option>MC+PDLLA</option>
+        <option value="__other__">other…</option>
+      </select>
+      <input type="text" id="metaTreatmentOther" placeholder="treatment group" style="display:none; margin-top:6px">
+      <label>Timepoint</label>
+      <select id="metaTimepoint" style="width:100%; padding:7px 9px; border:1px solid var(--line); border-radius:7px; font-size:13px; background:#fbfcfd">
+        <option value="">unknown</option>
+        <option value="3">3 months</option>
+        <option value="6">6 months</option>
+        <option value="9">9 months</option>
+      </select>
+      <label>Scan type</label>
+      <select id="metaScanType" style="width:100%; padding:7px 9px; border:1px solid var(--line); border-radius:7px; font-size:13px; background:#fbfcfd">
+        <option value="auto">auto-detect (recommended)</option>
+        <option value="invivo">in vivo</option>
+        <option value="exvivo">ex vivo specimen</option>
+      </select>
+      <label>Notes (optional)</label>
+      <input type="text" id="metaNotes" placeholder="anything worth recording about this scan">
+      <div class="error" id="metaError"></div>
+    </div>
+    <footer>
+      <button onclick="metaResolve(null)">Skip this scan</button>
+      <button class="primary" style="width:auto; margin:0" onclick="metaSubmit()">Start the run</button>
     </footer>
   </div>
 </div>
@@ -346,8 +396,16 @@ async function handleScanFiles(all) {
         body: JSON.stringify({folder: dirName, n_files: files.length})});
       await putFile(upload_id, files[0].file);
       const probe = await api(`/api/upload/${upload_id}/probe`);
+      let user_meta = null;
       if (!probe.known) {
-        // genuinely new scan: upload everything (first file already sent)
+        // Genuinely new scan: ask who/what it is first (names the outputs
+        // folder + fills the spreadsheet row), then upload everything.
+        user_meta = await askScanMeta(probe, dirName);
+        if (!user_meta) {
+          await api(`/api/upload/${upload_id}/discard`, {method: 'POST'});
+          errors.push(`${dirName}: skipped (no scan details entered)`);
+          continue;
+        }
         txt.textContent = `${tag}New scan — uploading…`;
         let done = 1;
         const rest = files.slice(1);
@@ -368,7 +426,7 @@ async function handleScanFiles(all) {
       }
       const run = await api('/api/autorun', {method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({upload_id})});
+        body: JSON.stringify(user_meta ? {upload_id, user_meta} : {upload_id})});
       started.push(run.label);
       txt.textContent = `${tag}Queued: ${run.label} (${modeName(run.mode)})`;
       if (!s) selectJob(run.id);
@@ -391,6 +449,49 @@ async function handleScanFiles(all) {
 function putFile(uploadId, file) {
   return api(`/api/upload/${uploadId}/file?name=${encodeURIComponent(file.name)}`,
              {method: 'PUT', body: file});
+}
+
+// ── new-scan metadata form ──────────────────────────────────
+let _metaResolve = null;
+$('metaTreatment').addEventListener('change', () =>
+  $('metaTreatmentOther').style.display =
+    $('metaTreatment').value === '__other__' ? '' : 'none');
+
+// Ask the user to identify an unrecognised uploaded scan. Pre-fills whatever
+// the DICOM header (StudyID / PatientName) or the dropped folder name gives.
+function askScanMeta(probe, folderName) {
+  $('metaError').textContent = '';
+  $('metaFolder').textContent = folderName +
+    (probe.study_id ? ` · scanner StudyID ${probe.study_id}` : '') +
+    (probe.patient_name ? ` · ${probe.patient_name}` : '');
+  const hint = [folderName, probe.patient_name, probe.patient_id, probe.study_id]
+    .map(s => ((s || '').match(/\d{4,6}/) || [])[0]).find(Boolean);
+  $('metaSample').value = hint || probe.study_id || '';
+  const tp = ((folderName + ' ' + (probe.patient_name || ''))
+    .match(/(\d+)\s*m(?:onth)?/i) || [])[1];
+  $('metaTimepoint').value = ['3', '6', '9'].includes(tp) ? tp : '';
+  $('metaTreatment').value = '';
+  $('metaTreatmentOther').style.display = 'none';
+  $('metaTreatmentOther').value = '';
+  $('metaScanType').value = 'auto';
+  $('metaNotes').value = '';
+  $('metaOverlay').classList.add('show');
+  $('metaSample').focus();
+  return new Promise(res => { _metaResolve = res; });
+}
+function metaResolve(v) {
+  $('metaOverlay').classList.remove('show');
+  if (_metaResolve) { _metaResolve(v); _metaResolve = null; }
+}
+function metaSubmit() {
+  const sample = $('metaSample').value.trim();
+  if (!sample) { $('metaError').textContent = 'A sample name / ID is required.'; return; }
+  let treatment = $('metaTreatment').value;
+  if (treatment === '__other__') treatment = $('metaTreatmentOther').value.trim();
+  metaResolve({sample, treatment: treatment || null,
+               timepoint: $('metaTimepoint').value || null,
+               scan_type: $('metaScanType').value,
+               notes: $('metaNotes').value.trim() || null});
 }
 
 document.querySelectorAll('input[name=mode]').forEach(r =>
@@ -459,18 +560,28 @@ async function startRun() {
 }
 
 // ── job list ────────────────────────────────────────────────
-const STATUS_LABEL = {queued: 'queued', running: 'running', done: 'passed',
-  done_warn: 'check warnings', done_fail: 'failed checks', failed: 'error',
-  cancelled: 'cancelled', interrupted: 'interrupted'};
+// User-visible badges are exactly: queued / running / passed / error
+// (the server maps its internal states via display_status; cancelled and
+// interrupted runs show a muted error badge with the cause as a tooltip).
+const dispStatus = job => job.display_status ||
+  ({queued: 'queued', running: 'running', done: 'passed', done_warn: 'passed'}
+    [job.status] || 'error');
+const statusBadge = job => {
+  const d = dispStatus(job);
+  const muted = (job.status === 'cancelled' || job.status === 'interrupted');
+  return `<span class="status st-${d}${muted ? ' muted' : ''}"
+    title="${d === 'error' ? job.status : d}">${d}</span>`;
+};
 async function refreshJobs() {
   const j = await api('/api/jobs');
   const el = $('jobList');
   if (!j.jobs.length) return;
   el.innerHTML = j.jobs.map(job => `
     <div class="job ${job.id === selectedJob ? 'sel' : ''}" onclick="selectJob('${job.id}')">
-      <div><div class="name">${job.label}</div>
+      <div><div class="name">${job.label}
+          ${job.manually_adjusted ? '<span class="adjbadge">readjusted</span>' : ''}</div>
         <div class="when">${new Date(job.created * 1000).toLocaleString()} &middot; ${modeName(job.mode)}</div></div>
-      <span class="status st-${job.status}">${STATUS_LABEL[job.status] || job.status}</span>
+      ${statusBadge(job)}
     </div>`).join('');
 }
 const modeName = m => ({'3m': '3-month, network placement',
@@ -496,7 +607,8 @@ async function pollDetail(force) {
     logLen = j.log_len;
     if (atEnd) $('dLog').scrollTop = $('dLog').scrollHeight;
   }
-  $('dTitle').textContent = `${j.label} — ${STATUS_LABEL[j.status] || j.status}`;
+  $('dTitle').innerHTML = `${j.label} ${statusBadge(j)}` +
+    (j.manually_adjusted ? ' <span class="adjbadge">readjusted</span>' : '');
   $('cancelBtn').style.display = (j.status === 'running' || j.status === 'queued') ? '' : 'none';
   const finished = (j.status || '').startsWith('done');
   $('dlBtn').style.display = finished ? '' : 'none';
@@ -517,50 +629,30 @@ async function pollDetail(force) {
   renderChecks(j); renderResults(j); renderPreview(j);
 }
 
+// Every successful run is added to the study spreadsheet automatically —
+// this line just reports what happened (identity of the row, or the error).
 function renderDatabase(j, finished) {
-  const btn = $('dbBtn'), line = $('dDatabase');
-  if (!finished) { btn.style.display = 'none'; line.style.display = 'none'; return; }
-  if (dbBusy) return;
-  btn.style.display = '';
+  const line = $('dDatabase');
+  if (!changed('database', [j.database, j.database_error, j.status])) return;
   const d = j.database;
   if (d && d.added) {
-    btn.textContent = 'Re-add to spreadsheet';
-    btn.classList.remove('primary');
     line.style.display = '';
-    line.innerHTML = `&#10003; This scan's spreadsheet row is <b>${d.roi_series}</b>` +
-      ` &middot; added ${new Date(d.added * 1000).toLocaleString()} &middot; <code>${(d.xlsx || '').split('/').slice(-2).join('/')}</code>`;
+    line.innerHTML = `<span style="color:var(--pass)">&#10003; in spreadsheet</span> — row <b>${d.roi_series}</b> ` +
+      `(${d.treatment || 'unknown group'}, subject ${d.subject || '?'}` +
+      (d.timepoint_months ? `, ${d.timepoint_months} months` : '') + `)` +
+      (d.manually_adjusted ? ' — flagged as manually adjusted' : '') +
+      ` &middot; updated ${new Date(d.added * 1000).toLocaleString()} &middot; <code>${(d.xlsx || '').split('/').slice(-2).join('/')}</code>`;
+  } else if (j.database_error) {
+    line.style.display = '';
+    line.innerHTML = `<span style="color:#b42318">Could not add to the spreadsheet: ${j.database_error}</span> — see the console log. The run itself is unaffected.`;
+  } else if (j.status === 'done_fail') {
+    line.style.display = '';
+    line.innerHTML = 'Not added to the study spreadsheet — a sanity check <b>failed</b>. Fix the placement (or re-run) first.';
+  } else if (finished) {
+    line.style.display = '';
+    line.textContent = 'Adding to the study spreadsheet automatically — this takes up to a minute.';
   } else {
-    btn.textContent = 'Add to spreadsheet';
-    btn.classList.add('primary');
-    line.style.display = '';
-    line.innerHTML = 'Not yet in the study spreadsheet (<code>radiomics_database/radiomics_database.xlsx</code>). ' +
-      'The spreadsheet keeps ONE row per scan — adding makes this run that row; adding another run of the same scan replaces it.';
-  }
-}
-
-let dbBusy = false;
-async function addToDatabase() {
-  if (!selectedJob || dbBusy) return;
-  const btn = $('dbBtn'), line = $('dDatabase');
-  dbBusy = true;
-  btn.disabled = true; btn.textContent = 'Adding…';
-  line.style.display = '';
-  line.textContent = 'Extracting features if needed and updating the spreadsheet — this takes up to a minute.';
-  try {
-    const r = await api(`/api/jobs/${selectedJob}/add-to-database`, {method: 'POST'});
-    line.innerHTML = `&#10003; ${r.replaced ? 'Replaced this scan\'s row with' : 'Added'} <b>${r.roi_series}</b> ` +
-      `(${r.treatment || 'unknown group'}, subject ${r.subject || '?'}` +
-      (r.timepoint_months ? `, ${r.timepoint_months} months` : '') + `)` +
-      (r.manually_adjusted ? ' — flagged as manually adjusted' : '') + `. ` +
-      `Spreadsheet now holds ${r.n_scans} scans.`;
-    dbBusy = false;
-    btn.disabled = false;
-    if (lastJob) { lastJob.database = {added: Date.now() / 1000, roi_series: r.roi_series, xlsx: r.xlsx}; }
-    btn.textContent = 'Re-add to spreadsheet'; btn.classList.remove('primary');
-  } catch (e) {
-    dbBusy = false;
-    btn.disabled = false; btn.textContent = 'Add to spreadsheet';
-    line.innerHTML = `<span style="color:#b42318">Could not add to the spreadsheet: ${e.message}</span> — see the console log.`;
+    line.style.display = 'none';
   }
 }
 
@@ -595,8 +687,11 @@ function renderAdjust(meta) {
        stroke-dasharray="6 4" vector-effect="non-scaling-stroke"/>`).join('');
   $('adjPanel').innerHTML = `
     <h2 style="margin-top:14px">Adjust placement</h2>
-    <div class="note">Drag the rings so the core sits on the defect. This writes a NEW
-      series flagged as manually adjusted — the automatic result is kept unchanged.
+    <div class="note">Drag the rings so the core sits on the defect. Applying
+      <b>updates this run in place</b>: the series files are re-stamped at the new
+      position, features re-extracted, and the scan's spreadsheet row refreshed —
+      the run stays permanently flagged as readjusted (the pose it replaced is kept,
+      and re-running the scan restores the automatic placement).
       ${lastJob && lastJob.mode === '3m'
         ? '<span class="mode-warning">This is a 3-month scan: the automatic fit is validated to ~0.21 mm — moving it usually makes placement worse.</span>' : ''}</div>
     <div id="adjWrap" style="position:relative; display:inline-block; margin-top:10px; max-width:100%">
@@ -655,7 +750,8 @@ async function applyAdjust() {
   if (!adj) return;
   const off = Math.hypot(adj.du, adj.dv);
   if (off < 0.05) { alert('Drag the rings first — the offset is zero.'); return; }
-  let msg = `Write a new series shifted ${off.toFixed(2)} mm? It will be permanently flagged as manually adjusted.`;
+  let msg = `Re-stamp this run shifted ${off.toFixed(2)} mm? The run is updated in place ` +
+    `(files, features and spreadsheet row replaced) and permanently flagged as readjusted.`;
   if (lastJob && lastJob.mode === '3m')
     msg += '\n\nNote: on 3-month scans the automatic fit is usually more accurate than the eye.';
   if (off > 2.5)

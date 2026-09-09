@@ -1,7 +1,11 @@
 # Defect Segmenter — Lab User Guide
 
 Segment a rabbit calvarial defect scan and get its bone-healing numbers in
-three steps. No programming needed.
+three steps. No programming needed. The whole workflow is:
+
+> **Drop the scan in → (fill in its details if the app doesn't know it) →
+> results appear and the study spreadsheet updates itself → nudge the
+> placement if needed (the run updates in place) → done.**
 
 ---
 
@@ -28,16 +32,23 @@ rest on its own:
   - *6- or 9-month scan* → the ROI is placed by registration from that same
     animal's 3-month ROI, which the app locates by itself. This is the
     validated method — the AI alone is 2–3 mm off at later timepoints.
-  - *Scan it doesn't recognise* → the whole scan uploads (a few GB — give it
-    a few minutes), then AI placement runs and the result is clearly flagged
-    so you know the timepoint rules above couldn't be checked.
+  - *Scan it doesn't recognise* → a short form pops up first: give the scan
+    a **sample name/ID** (required), its treatment group, timepoint and scan
+    type, plus optional notes. The app pre-fills what it can read from the
+    scan itself. Then the whole scan uploads (a few GB — give it a few
+    minutes) and placement runs; what you entered names the results folder
+    and fills the scan's spreadsheet row.
   - *Ex vivo specimen scan* (excised skull piece on the SCANCO µCT) → the AI
     isn't used at all: the defect is already the centre of the specimen, so
     the app finds it geometrically from the bone itself and stamps the same
     10/18 mm template. Ex vivo numbers are measured at ~15 µm — compare them
     only with other ex vivo numbers, never with in vivo ones.
-- Re-running a scan never destroys anything: results get a `_v2`, `_v3`…
-  name, and the hand-labeled ground-truth folders can't be overwritten at all.
+- Every run's files land in one place: the **`outputs`** folder next to the
+  group folders, one subfolder per scan named
+  `outputs/<sample>_<timepoint>_<treatment>/` (e.g. `outputs/37952_3m_Defect/`).
+  Re-running a scan simply replaces that folder's contents — no `_v2` copies
+  pile up — and the hand-labeled ground-truth folders can't be overwritten
+  at all.
 
 You can drop the whole subject folder if that's easier — the app finds the
 raw scan inside it. You can also drop **several scan folders at once** (or a
@@ -50,7 +61,7 @@ another automatically**. Once the upload bar finishes you can close the
 browser; the jobs run on the server. On a Mac the app keeps the machine from
 idle-sleeping while a job is running, and if the app is restarted, jobs that
 were still waiting in the queue pick up where they left off (a job that was
-interrupted *mid-run* is flagged instead — re-run that one yourself). Come
+interrupted *mid-run* shows as **error** instead — re-run that one yourself). Come
 back in the morning and read each run's checks as usual. Two practical notes:
 don't let the machine run out of disk (an ex vivo run writes ~10 GB), and
 keep laptops plugged in — macOS only honours the keep-awake on AC power.
@@ -58,13 +69,19 @@ keep laptops plugged in — macOS only honours the keep-awake on AC power.
 ## 3. Read the results
 
 Click the run in the **Runs** list (it updates live; a 3-month scan takes a
-few minutes, a registration run longer).
+few minutes, a registration run longer). Every run shows one of four badges:
 
-**a. Sanity checks — every line should be a green ✓.**
-- ⚠ yellow: finished, but read the warning and look at the preview picture
-  before using the numbers.
-- ✕ red: do **not** use the numbers. Usually the model latched onto the wrong
-  thing — re-run or ask for help.
+- **queued** / **running** — waiting its turn, or working.
+- **passed** — finished and usable (already added to the spreadsheet).
+- **error** — do **not** use the numbers: the run crashed, was cancelled, or
+  a sanity check failed. Open the run to see why.
+
+**a. Sanity checks — every line should be a green ✓.** (They're inside the
+run page; the badge only summarises them.)
+- ⚠ yellow: the run still shows **passed**, but read the warning and look at
+  the preview picture before using the numbers.
+- ✕ red: the run shows **error** and is NOT added to the spreadsheet.
+  Usually the model latched onto the wrong thing — re-run or ask for help.
 
 **b. The number to record** is the big blue **Core : ring BV/TV ratio** —
 how mineralised the defect is relative to the intact bone around it
@@ -82,18 +99,19 @@ with the full ~38-feature set saved as `…_features.csv` next to the series
 and inside the results zip. Only compare features between runs of the same
 scan type (in vivo with in vivo, ex vivo with ex vivo).
 
-**c3. Add it to the study spreadsheet.** If the checks look good, click
-**Add to spreadsheet**. The run becomes one row in
+**c3. The study spreadsheet updates itself.** Every run that finishes as
+**passed** is added automatically to
 `radiomics_database/radiomics_database.xlsx` (next to the group folders):
 treatment, subject, timepoint, placement method, checks, and every core /
-ring / core-to-ring feature. The spreadsheet has **one `database` sheet with
-one row per scan** — the row is exactly the run you added. Adding another
-run of the same scan (a re-run, or a manual nudge) replaces that scan's row,
-so the sheet never collects duplicates. Nothing is added until you click.
+ring / core-to-ring feature. The run page shows **"✓ in spreadsheet"** with
+the row it became. The spreadsheet has **one `database` sheet with one row
+per scan** — a re-run or a manual nudge replaces that scan's row, so the
+sheet never collects duplicates. Runs that end in **error** are never added.
 
-**d. Where the files went.** For archive scans, the DICOM series are written
-next to the scan (e.g. `37951_6m_output_dicom…`) ready for the existing
-analysis workflow. For uploaded scans — or to take results elsewhere — click
+**d. Where the files went.** Everything is in the central **`outputs`**
+folder, one subfolder per scan
+(`outputs/<sample>_<timepoint>_<treatment>/`), holding the five DICOM series,
+the preview picture and the feature files. To take results elsewhere, click
 **Download results** for a zip.
 
 ## Nudging the placement by hand (use sparingly)
@@ -105,10 +123,13 @@ core sits on the defect — the offset shows live in mm — and click
 
 Three things to know before you use it:
 
-- The automatic result is **never modified**. Your nudge writes a *new* series
-  (`…_adj`), and that series is **permanently flagged as manually adjusted**
-  in its checks. Never mix manually placed and automatically placed ROIs in
-  the same comparison.
+- The nudge **updates that run in place**: the same files in the same
+  `outputs` folder are re-stamped at the new position, the features are
+  re-extracted, and the scan's spreadsheet row is refreshed. The run gets a
+  permanent **"readjusted"** badge and its row is flagged
+  `manually_adjusted` — never mix manually placed and automatically placed
+  ROIs in the same comparison. (The position it replaced is kept by the app,
+  and simply re-running the scan restores the automatic placement.)
 - **On 3-month scans, don't.** The automatic fit matches the annotation
   protocol to ~0.21 mm; in a validated test, placements that "looked more
   centred" were actually *worse* on 11 of 12 subjects. The app will remind
