@@ -508,6 +508,26 @@ def worker():
         save_jobs()
 
 
+# Writes {'center_mm', 'axis'} of a reference ROI series to a JSON file —
+# used as a registration hint when the network's own hint is unusable.
+RESCUE_HINT_SNIPPET = (
+    "import json, sys\n"
+    "from axial_view import AxialView\n"
+    "av = AxialView(sys.argv[1], sys.argv[2])\n"
+    "json.dump({'center_mm': [float(x) for x in av.center_mm],\n"
+    "           'axis': [float(x) for x in av.axis]}, open(sys.argv[3], 'w'))\n")
+
+
+def _dice_gate_failed(jid: str) -> bool:
+    """True when the job log's tail shows 4_propagate_roi's dice-gate refusal
+    (as opposed to a crash), which is the one failure worth a rescue retry."""
+    try:
+        text = job_log_path(jid).read_text(errors='replace')[-3000:]
+    except OSError:
+        return False
+    return '--dice-min' in text and 'registration not trusted' in text
+
+
 def _run_job(job):
     p = job['params']
     out = Path(p['output'])
@@ -549,6 +569,30 @@ def _run_job(job):
             if p.get('wide_search'):
                 cmd.append('--wide-search')
             rc = run_step(job, cmd, fh)
+            if rc != 0 and _dice_gate_failed(job['id']):
+                # On well-healed defects the network's detection hint can be
+                # unusable (validated case: 38744 at 6 months in the
+                # 2026-08-11 batch, rescued with a "synthetic 3m-position
+                # hint"). Retry once: initialize registration from the
+                # reference ROI's own pose and widen the rotation search.
+                fh.write('\nRegistration failed its dice gate with the network '
+                         'hint — retrying once with the reference-pose hint '
+                         'and a wide rotation search...\n')
+                fh.flush()
+                synth = APP_DIR / f'{job["id"]}_rescue_hint.json'
+                rc2 = run_step(job, [PYTHON, '-c', RESCUE_HINT_SNIPPET,
+                                     p['ref_input'], p['ref_roi'], synth], fh)
+                if rc2 == 0:
+                    rc = run_step(job, [PYTHON, '4_propagate_roi.py',
+                                        '--ref-input', p['ref_input'],
+                                        '--ref-roi', p['ref_roi'],
+                                        '--target-input', p['input'],
+                                        '--target-fit', synth,
+                                        '--output', out, '--bone-refine',
+                                        '--bone-threshold', thr,
+                                        '--wide-search'], fh)
+                    if rc == 0:
+                        job['registration_rescue'] = True
             if rc != 0:
                 raise RuntimeError(f'registration step exited with code {rc} — '
                                    'see the end of the console log for the cause '
@@ -653,8 +697,11 @@ def parse_metrics(log: str) -> dict:
         m['roi_enclosed_pct'] = float(roi.group(3))
     m['active_slices'] = grab(r'Active Z\s*:\s*\d+\s*→\s*\d+\s*\((\d+) slices\)', int)
     m['low_active_warning'] = grab(r'WARNING: only (\d+) active slices', int)
-    m['dice'] = grab(r'bone dice = ([\d.]+)')
-    m['spin_deg'] = grab(r'best spin start = (\-?\d+) deg', int)
+    # last=True: a rescued registration logs a failed attempt first — the
+    # final (successful) attempt's numbers are the ones that describe the
+    # written series.
+    m['dice'] = grab(r'bone dice = ([\d.]+)', last=True)
+    m['spin_deg'] = grab(r'best spin start = (\-?\d+) deg', int, last=True)
     m['no_prediction'] = 'No defect region predicted' in log
     off = re.search(r'low-density centroid[^\n]*→\s*([\d.]+) mm', log)
     if off:
@@ -791,6 +838,13 @@ def build_checks(job) -> list:
         add('Placement method', 'pass',
             'Registration from the 3-month reference ROI — the validated '
             'workflow for non-3-month scans.')
+        if job.get('registration_rescue'):
+            add('Registration rescue', 'warn',
+                'The network could not usably detect this defect (typical for '
+                'well-healed defects), so registration was initialized from '
+                'the 3-month ROI pose with a wide rotation search — the same '
+                'rescue validated on 38744/6m in the 2026-08-11 batch. The '
+                'dice gate still applied; double-check the preview picture.')
     elif job['mode'] == 'exvivo':
         add('Placement method', 'pass',
             'Ex vivo geometric placement — the defect is located from the '
