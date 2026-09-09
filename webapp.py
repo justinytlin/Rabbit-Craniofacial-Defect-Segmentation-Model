@@ -62,6 +62,8 @@ SCAN_ROOTS = list(ALLOWED_ROOTS)
 
 UPLOADS_DIR = APP_DIR / 'uploads'
 INDEX_FILE = APP_DIR / 'scan_index.json'
+DATABASE_DIR = DATA_ROOT / 'radiomics_database'       # study-wide spreadsheet (7_build_database.py)
+DATABASE_LOCK = threading.Lock()
 
 JOBS = {}          # id -> job dict
 JOB_LOCK = threading.Lock()
@@ -271,7 +273,12 @@ def detect_context(input_dir: Path) -> dict:
                             # only a series with actual files can be a reference
                             if count_dcm(Path(e.path), cap=10) > 0:
                                 rois.append(Path(e.path))
-                        elif count_dcm(Path(e.path), cap=600) >= 500:
+                        elif 'output_dicom' not in n.lower() and \
+                                count_dcm(Path(e.path), cap=600) >= 500:
+                            # 'output_dicom' anywhere in the name means a
+                            # written ROI series (or a _cylinder/_ring/_bone
+                            # sub-series) — never a raw reference scan, even
+                            # though those dirs also hold 1200 .dcm files.
                             dicoms.append(Path(e.path))
                 except OSError:
                     pass
@@ -280,9 +287,11 @@ def detect_context(input_dir: Path) -> dict:
                     info['ref_roi'] = str(gt[0])
                 elif rois:
                     info['ref_roi'] = str(rois[0])
-                pref = [d for d in dicoms if 'dicom' in d.name.lower()]
-                if pref or dicoms:
-                    info['ref_input'] = str((pref or dicoms)[0])
+                if dicoms:
+                    dicoms.sort(key=lambda d: (
+                        0 if d.name.lower().startswith('dicom') else
+                        1 if 'dicom' in d.name.lower() else 2, d.name))
+                    info['ref_input'] = str(dicoms[0])
                 break
     return info
 
@@ -836,6 +845,57 @@ def build_checks(job) -> list:
 
 # ─────────────────────────────────────────────────────────────── HTTP layer
 
+# ───────────────────────────────────────────────── radiomics database
+
+def database_status() -> dict:
+    xlsx = DATABASE_DIR / 'radiomics_database.xlsx'
+    csv_db = DATABASE_DIR / 'radiomics_database.csv'
+    info = {'path': str(xlsx), 'exists': xlsx.exists(), 'n_scans': None,
+            'updated': None}
+    if xlsx.exists():
+        info['updated'] = xlsx.stat().st_mtime
+    if csv_db.exists():
+        try:
+            import csv as _csv
+            with open(csv_db, newline='') as fh:
+                info['n_scans'] = sum(1 for _ in _csv.DictReader(fh))
+        except OSError:
+            pass
+    return info
+
+
+def add_job_to_database(job) -> dict:
+    """Upsert one finished run into the study spreadsheet via
+    7_build_database.py --add-job (features are extracted first if missing)."""
+    with DATABASE_LOCK:
+        proc = subprocess.run(
+            [PYTHON, str(REPO_DIR / '7_build_database.py'), '--add-job', job['id'],
+             '--out', str(DATABASE_DIR)],
+            cwd=str(REPO_DIR), capture_output=True, text=True, timeout=1800)
+    with open(job_log_path(job['id']), 'a') as fh:
+        fh.write(f'\nAdding to the study spreadsheet ({DATABASE_DIR.name})...\n')
+        fh.write(proc.stdout)
+        if proc.stderr:
+            fh.write(proc.stderr)
+    result = None
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith('RESULT '):
+            try:
+                result = json.loads(line[7:])
+            except json.JSONDecodeError:
+                pass
+            break
+    if proc.returncode != 0 or not result:
+        tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
+        raise RuntimeError('; '.join(tail) or f'exit code {proc.returncode}')
+    job['database'] = {'added': time.time(), 'roi_series': result.get('roi_series'),
+                       'replaced': result.get('replaced'),
+                       'manually_adjusted': result.get('manually_adjusted'),
+                       'n_scans': result.get('n_scans'), 'xlsx': result.get('xlsx')}
+    save_jobs()
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):                  # quiet
         pass
@@ -983,6 +1043,9 @@ class Handler(BaseHTTPRequestHandler):
                 ctx['suggested_output'] = str(p.parent / base)
             self._json(ctx)
 
+        elif route == '/api/database':
+            self._json(database_status())
+
         elif route == '/api/jobs':
             with JOB_LOCK:
                 jobs = [_job_summary(JOBS[j]) for j in
@@ -1052,6 +1115,20 @@ class Handler(BaseHTTPRequestHandler):
             if d.is_dir():
                 shutil.rmtree(d, ignore_errors=True)
             return self._json({'ok': True})
+
+        if route.startswith('/api/jobs/') and route.endswith('/add-to-database'):
+            jid = route.split('/')[3]
+            job = JOBS.get(jid)
+            if not job:
+                return self._err('no such job', 404)
+            if not str(job.get('status', '')).startswith('done'):
+                return self._err('only a finished run can be added to the spreadsheet')
+            try:
+                result = add_job_to_database(job)
+            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                return self._err(f'could not add to the spreadsheet: {e}', 500)
+            result['database'] = database_status()
+            return self._json(result)
 
         if route.startswith('/api/jobs/') and route.endswith('/cancel'):
             jid = route.split('/')[3]

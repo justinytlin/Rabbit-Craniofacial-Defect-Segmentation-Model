@@ -82,6 +82,15 @@ with the full ~38-feature set saved as `…_features.csv` next to the series
 and inside the results zip. Only compare features between runs of the same
 scan type (in vivo with in vivo, ex vivo with ex vivo).
 
+**c3. Add it to the study spreadsheet.** If the checks look good, click
+**Add to spreadsheet**. The run becomes one row in
+`radiomics_database/radiomics_database.xlsx` (next to the group folders):
+treatment, subject, timepoint, placement method, checks, and every core /
+ring / core-to-ring feature. The spreadsheet has **one `database` sheet with
+one row per scan** — the row is exactly the run you added. Adding another
+run of the same scan (a re-run, or a manual nudge) replaces that scan's row,
+so the sheet never collects duplicates. Nothing is added until you click.
+
 **d. Where the files went.** For archive scans, the DICOM series are written
 next to the scan (e.g. `37951_6m_output_dicom…`) ready for the existing
 analysis workflow. For uploaded scans — or to take results elsewhere — click

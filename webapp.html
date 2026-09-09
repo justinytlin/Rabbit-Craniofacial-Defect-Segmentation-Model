@@ -215,10 +215,12 @@
         <span>
           <button id="adjBtn" style="display:none" onclick="openAdjust()">Adjust placement</button>
           <a id="dlBtn" style="display:none" href="#"><button>Download results</button></a>
+          <button id="dbBtn" class="primary" style="display:none; width:auto; margin:0" onclick="addToDatabase()">Add to spreadsheet</button>
           <button id="cancelBtn" style="display:none" onclick="cancelJob()">Cancel</button>
         </span>
       </h2>
       <div class="chips" id="dContext"></div>
+      <div class="note" id="dDatabase" style="display:none"></div>
       <div id="adjPanel" style="display:none"></div>
       <div id="dChecks"></div>
       <div id="dResults"></div>
@@ -500,6 +502,7 @@ async function pollDetail(force) {
   $('dlBtn').style.display = finished ? '' : 'none';
   if (finished) $('dlBtn').href = `/api/jobs/${j.id}/download`;
   $('adjBtn').style.display = finished ? '' : 'none';
+  renderDatabase(j, finished);
   lastJob = j;
   if (changed('context', [j.context, j.placement_note, j.params])) {
     const chips = [];
@@ -512,6 +515,53 @@ async function pollDetail(force) {
     $('dContext').innerHTML = chips.map(x => `<span class="chip">${x}</span>`).join('');
   }
   renderChecks(j); renderResults(j); renderPreview(j);
+}
+
+function renderDatabase(j, finished) {
+  const btn = $('dbBtn'), line = $('dDatabase');
+  if (!finished) { btn.style.display = 'none'; line.style.display = 'none'; return; }
+  if (dbBusy) return;
+  btn.style.display = '';
+  const d = j.database;
+  if (d && d.added) {
+    btn.textContent = 'Re-add to spreadsheet';
+    btn.classList.remove('primary');
+    line.style.display = '';
+    line.innerHTML = `&#10003; This scan's spreadsheet row is <b>${d.roi_series}</b>` +
+      ` &middot; added ${new Date(d.added * 1000).toLocaleString()} &middot; <code>${(d.xlsx || '').split('/').slice(-2).join('/')}</code>`;
+  } else {
+    btn.textContent = 'Add to spreadsheet';
+    btn.classList.add('primary');
+    line.style.display = '';
+    line.innerHTML = 'Not yet in the study spreadsheet (<code>radiomics_database/radiomics_database.xlsx</code>). ' +
+      'The spreadsheet keeps ONE row per scan — adding makes this run that row; adding another run of the same scan replaces it.';
+  }
+}
+
+let dbBusy = false;
+async function addToDatabase() {
+  if (!selectedJob || dbBusy) return;
+  const btn = $('dbBtn'), line = $('dDatabase');
+  dbBusy = true;
+  btn.disabled = true; btn.textContent = 'Adding…';
+  line.style.display = '';
+  line.textContent = 'Extracting features if needed and updating the spreadsheet — this takes up to a minute.';
+  try {
+    const r = await api(`/api/jobs/${selectedJob}/add-to-database`, {method: 'POST'});
+    line.innerHTML = `&#10003; ${r.replaced ? 'Replaced this scan\'s row with' : 'Added'} <b>${r.roi_series}</b> ` +
+      `(${r.treatment || 'unknown group'}, subject ${r.subject || '?'}` +
+      (r.timepoint_months ? `, ${r.timepoint_months} months` : '') + `)` +
+      (r.manually_adjusted ? ' — flagged as manually adjusted' : '') + `. ` +
+      `Spreadsheet now holds ${r.n_scans} scans.`;
+    dbBusy = false;
+    btn.disabled = false;
+    if (lastJob) { lastJob.database = {added: Date.now() / 1000, roi_series: r.roi_series, xlsx: r.xlsx}; }
+    btn.textContent = 'Re-add to spreadsheet'; btn.classList.remove('primary');
+  } catch (e) {
+    dbBusy = false;
+    btn.disabled = false; btn.textContent = 'Add to spreadsheet';
+    line.innerHTML = `<span style="color:#b42318">Could not add to the spreadsheet: ${e.message}</span> — see the console log.`;
+  }
 }
 
 async function cancelJob() {

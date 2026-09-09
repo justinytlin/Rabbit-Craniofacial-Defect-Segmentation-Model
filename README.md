@@ -48,7 +48,9 @@ automatic:
   Green means trust it; red means discard it.
 - **Results on screen**: ROI volumes, core/ring BV/TV at the chosen
   threshold, the core-to-ring ratio (the number to report), Otsu + radiomic
-  features, the axial preview, and a **Download results** zip.
+  features, the axial preview, a **Download results** zip, and an **Add to
+  spreadsheet** button that appends the run to the study-wide radiomics
+  database (`radiomics_database/radiomics_database.xlsx`).
 - **Batches run unattended**: drop several scan folders at once (or a folder
   containing many scans) and each becomes a queued job — jobs run one after
   another, the Mac is kept from idle-sleeping while they run, and still-queued
@@ -156,6 +158,32 @@ in an in vivo core containing air it separates air from tissue (it can land
 near −300 HU), not bone from soft tissue, which is why the fixed-threshold
 BV/TV remains the headline number.
 
+### Building the study-wide radiomics database
+
+```bash
+python 7_build_database.py            # add --no-extract to re-assemble without extracting
+```
+
+The spreadsheet is ONE sheet, one row per scan
+(`../radiomics_database/radiomics_database.xlsx`, sheets `README`,
+`database`, `feature_dictionary`, plus `radiomics_database.csv`). Each row
+carries treatment, subject, timepoint, scan type, placement method (with a
+`manually_adjusted` flag for `_adj` nudges), the QC outcome (web-app checks
+or the 2026-08-11 batch QC), the template pose, and `core_*`, `ring_*`,
+`core_to_ring_*` columns for all 113 features. Rows are keyed by scanner
+StudyID, so re-adding a scan — from any export folder — replaces its row
+instead of duplicating it. The normal path is incremental: every finished
+web-app run shows an **Add to spreadsheet** button, and the row reflects
+exactly the run the user added (equivalent to
+`python 7_build_database.py --add-job JOB_ID`). The full rebuild above
+instead picks the best series on disk per scan (ground truth first; a manual
+`_adj` series only when nothing else exists) and writes stub rows for scans
+with no usable series.
+
+A full rebuild re-scans the whole archive; it does not include scans that
+were uploaded through the app rather than archived — add those from their
+run pages.
+
 ### Stamping at an explicit pose
 
 ```bash
@@ -211,6 +239,7 @@ automatically decimates ex vivo scans so memory stays manageable.
 4_propagate_roi.py       in vivo: place later-timepoint ROIs by registration
 5_exvivo_roi.py          ex vivo: place the ROI geometrically (no network)
 stamp_roi.py             stamp the template at an explicit pose
+7_build_database.py      study-wide radiomics spreadsheet (all scans, core/ring features)
 webapp.py + webapp.html  local web app wrapping all of the above
 Launch Defect Segmenter.command   double-click launcher for the web app
 axial_view.py            reslice perpendicular to the fitted defect axis
