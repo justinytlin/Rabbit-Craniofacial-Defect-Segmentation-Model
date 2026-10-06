@@ -38,6 +38,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -108,6 +109,24 @@ FEATURE_FAMILIES = [
     ('fraction_low', 'Otsu / bone', 'Fraction of voxels in the low multi-Otsu class', 'fraction'),
     ('fraction_mid', 'Otsu / bone', 'Fraction of voxels in the middle multi-Otsu class', 'fraction'),
     ('fraction_high', 'Otsu / bone', 'Fraction of voxels in the high multi-Otsu class', 'fraction'),
+    # 8_density_particles.py sidecar (<series>_density.json)
+    ('bmd_mgha', 'density', 'Mean mineral density over the whole region, from the SCANCO HA calibration in the DICOM (ex vivo only; empty for in vivo — no calibration)', 'mg HA/cm^3'),
+    ('tmd_mgha', 'density', 'Tissue mineral density: mean density of voxels above 226 mg HA/cm^3 (ex vivo only)', 'mg HA/cm^3'),
+    ('bvtv_226mgha', 'density', 'BV/TV at a true 226 mg HA/cm^3 (~1365 HU on SCANCO; ex vivo only). Stricter than bvtv_fixed, whose 226 HU is only ~24 mg HA/cm^3 on SCANCO', 'fraction'),
+    ('particle_count', 'particles', 'Ex vivo only. Number of 26-connected mineralised pieces in the region (Gaussian sigma 0.8 voxel, > 226 mg HA/cm^3, >= 0.01 mm^3) — residual scaffold and bone islands; pieces are cut at the region boundary', 'count'),
+    ('particle_number_density', 'particles', 'particle_count / region volume', 'per mm^3'),
+    ('particle_volume_mean_mm3', 'particles', 'Mean particle volume', 'mm^3'),
+    ('particle_volume_median_mm3', 'particles', 'Median particle volume', 'mm^3'),
+    ('particle_volume_p90_mm3', 'particles', '90th percentile of particle volume', 'mm^3'),
+    ('particle_eqdiam_mean_mm', 'particles', 'Mean equivalent-sphere diameter of the particles', 'mm'),
+    ('particle_largest_fraction', 'particles', 'Fraction of particle volume in the largest particle', 'fraction'),
+    ('particle_mean_hu', 'particles', 'Mean over particles of each particle\'s mean HU', 'HU'),
+    ('particle_mean_mgha', 'particles', 'Mean over particles of each particle\'s mean mineral density (ex vivo only)', 'mg HA/cm^3'),
+    ('specimen_fraction', 'specimen', 'Fraction of the region inside the specimen (convex hull of its mineralised footprint). Below 1 when a cut specimen (#262 batch) leaves part of the region in air/medium. Ex vivo only', 'fraction'),
+    ('spec_bvtv_226mgha', 'specimen', 'BV/TV at 226 mg HA/cm^3 counting only the region inside the specimen (ex vivo only)', 'fraction'),
+    ('spec_bmd_mgha', 'specimen', 'Mean mineral density of the region inside the specimen (ex vivo only)', 'mg HA/cm^3'),
+    ('spec_particle_number_density', 'specimen', 'particle_count / region volume inside the specimen (ex vivo only)', 'per mm^3'),
+    ('particle_nn_dist_mean_mm', 'particles', 'Mean distance from each particle centroid to its nearest neighbour', 'mm'),
 ]
 FAMILY_PREFIX = {
     'glcm_': ('GLCM', '3D grey-level co-occurrence, 13 directions merged, distance 1, 32 bins'),
@@ -438,6 +457,53 @@ def ensure_features(scan, ser, jobs, do_extract: bool, log) -> str:
     return 'extracted now'
 
 
+def density_sidecar(series_dir: Path) -> Path:
+    return series_dir.parent / (series_dir.name + '_density.json')
+
+
+def ensure_density(scan, ser, do_extract: bool, log) -> None:
+    """Density/particle sidecar (8_density_particles.py). Optional — a failure
+    never blocks the row; its columns are simply left empty."""
+    sdir = Path(ser['series_dir'])
+    f = density_sidecar(sdir)
+    if not do_extract or not features_path(sdir).exists():
+        return
+    if f.exists() and os.stat(f).st_mtime >= newest_mtime(sdir):
+        return
+    cmd = [PYTHON, str(REPO_DIR / '8_density_particles.py'),
+           '--input', scan['scan_dir'], '--roi', str(sdir)]
+    print(f'  density/particles {sdir.name} ...', flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    log.write(f'\n### density {sdir}\n{r.stdout}\n{r.stderr}\n')
+    log.flush()
+    if r.returncode != 0:
+        print(f'    density/particles FAILED ({r.returncode}) — see extraction log', flush=True)
+
+
+def density_columns(series_dir: Path) -> dict:
+    """core_/ring_/core_to_ring_ columns from the density sidecar, if any."""
+    f = density_sidecar(series_dir)
+    if not f.exists():
+        return {}
+    try:
+        d = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    core, ring = d.get('core', {}), d.get('ring', {})
+    cols = {}
+    for k in core:
+        cols[f'core_{k}'] = core.get(k)
+    for k in ring:
+        cols[f'ring_{k}'] = ring.get(k)
+    for k in core:
+        cv, rv = core.get(k), ring.get(k)
+        try:
+            cols[f'core_to_ring_{k}'] = float(cv) / float(rv) if (cv is not None and rv not in (None, 0) and np.isfinite(cv) and np.isfinite(rv) and rv != 0) else None
+        except (TypeError, ValueError):
+            cols[f'core_to_ring_{k}'] = None
+    return cols
+
+
 # ───────────────────────────────────────────────────────────── assembly
 
 def series_row(scan, ser, jobs, qc, feat_status):
@@ -530,6 +596,7 @@ def series_row(scan, ser, jobs, qc, feat_status):
                 row[f'core_to_ring_{k}'] = float(cv) / float(rv) if (cv is not None and rv not in (None, 0) and np.isfinite(cv) and np.isfinite(rv) and rv != 0) else None
             except (TypeError, ValueError):
                 row[f'core_to_ring_{k}'] = None
+        row.update(density_columns(sdir))
     return row
 
 
@@ -565,7 +632,8 @@ WHAT IS IN HERE
                      first, then the standard automatic series; a manual _adj nudge only
                      when nothing else exists). Scans with no usable series appear as stub
                      rows with empty features, so nothing silently disappears.
-  feature_dictionary Family, description and units for each of the 113 features.
+  feature_dictionary Family, description and units for each feature (113 radiomic features
+                     plus the density / particle add-on from 8_density_particles.py).
   (radiomics_database.csv next to this file mirrors the `database` sheet.)
 
 REGIONS
@@ -605,6 +673,17 @@ RULES (from defect_segmentation/README.md)
   * bvtv_fixed is recomputed by the feature extractor on the template re-fitted from the written
     series; it agrees with the 2026-08-11 cohort table to within ~0.5 pp for most scans (max 1.4 pp,
     37950 at 3 months). Use the values here consistently rather than mixing the two sources.
+
+DENSITY AND PARTICLES (8_density_particles.py, separate <series>_density.json sidecar)
+  *_mgha columns     Calibrated mineral density from the SCANCO HA calibration stored in each
+                     ex vivo DICOM. EMPTY for in vivo rows: the SOFIE scans carry no mineral
+                     calibration (an HA phantom scan would be needed); use mean_hu / bone_mean_hu.
+  particle_*         Ex vivo only. Discrete mineralised pieces in the region (Gaussian sigma
+                     0.8 voxel, > 226 mg HA/cm^3, 26-connected, >= 0.01 mm^3): residual scaffold
+                     and bone islands. Count, number density, size, per-particle density,
+                     nearest-neighbour spacing. Empty for in vivo: at 100 µm a particle count
+                     measured noise/fragmentation, not material (empty defect > scaffold).
+  tmd_mgha, bvtv_226mgha  Ex vivo, at a true 226 mg HA/cm^3. bvtv_fixed is unchanged.
 
 SCANS WITHOUT FEATURES
   Stub rows with an empty roi_series and a feature_status note. Known: 41122 at 9 months —
@@ -672,6 +751,7 @@ def main():
                 continue
             ser = series[prim]
             status = ensure_features(scan, ser, jobs, not args.no_extract, log)
+            ensure_density(scan, ser, not args.no_extract, log)
             r = series_row(scan, ser, jobs, qc, status)
             r['other_series_on_disk'] = '; '.join(others)
             rows.append(r)
@@ -691,8 +771,20 @@ def order_columns(df):
     return df[[c for c in ordered if c in df.columns]], feat_names
 
 
+def backup_outputs(out_dir: Path) -> None:
+    """Copy the current CSV/XLSX to backup_<today>/ before they are overwritten.
+    Only the first write of a day is kept, so web-app runs do not pile up copies."""
+    bdir = out_dir / f'backup_{datetime.now().strftime("%Y-%m-%d")}'
+    for name in ('radiomics_database.csv', 'radiomics_database.xlsx'):
+        src, dst = out_dir / name, bdir / name
+        if src.exists() and not dst.exists():
+            bdir.mkdir(exist_ok=True)
+            shutil.copy2(src, dst)
+
+
 def write_outputs(df, out_dir):
     """Write the CSV and the single-sheet workbook (one row per scan)."""
+    backup_outputs(out_dir)
     df, feat_names = order_columns(df)
     df = df.sort_values(['scan_type', 'treatment', 'subject', 'timepoint_months'],
                         na_position='last').reset_index(drop=True)
@@ -781,6 +873,36 @@ def load_existing(out_dir: Path):
     return df
 
 
+def carry_over_xlsx_edits(df, out_dir: Path, str_cols=()):
+    """People edit radiomics_database.xlsx by hand (e.g. filling in ex vivo
+    treatment groups); the CSV does not see those edits. Copy any differing
+    non-feature cell from the workbook so rewriting both files keeps them."""
+    xlsx = out_dir / 'radiomics_database.xlsx'
+    if not xlsx.exists():
+        return df
+    x = pd.read_excel(xlsx, sheet_name='database',
+                      dtype={c: str for c in str_cols})   # dates/IDs stored as numbers
+    key = ['roi_series_dir', 'scan_dir']
+    if len(x) != len(df) or any(
+            not df[k].fillna('').astype(str).equals(x[k].fillna('').astype(str)) for k in key):
+        raise SystemExit('radiomics_database.xlsx and .csv have different rows — '
+                         'reconcile them before merging (nothing was written)')
+    for col in df.columns:
+        if col.startswith(('core_', 'ring_')) or col not in x.columns:
+            continue
+        a, b = df[col], x[col]
+        if pd.api.types.is_numeric_dtype(a) and pd.api.types.is_numeric_dtype(b):
+            diff = ~np.isclose(a.astype(float), b.astype(float), rtol=1e-9, equal_nan=True)
+        else:
+            norm = lambda v: v.fillna('').astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+            diff = (norm(a) != norm(b)).to_numpy()
+        if diff.any():
+            print(f'  keeping {int(diff.sum())} hand edit(s) to "{col}" from the workbook')
+            df[col] = df[col].astype(object)
+            df.loc[diff, col] = b[diff].to_numpy()
+    return df
+
+
 def scan_for_job(job: dict) -> dict:
     """Describe the scan behind a web-app run, including uploaded scans that
     live outside the archive layout. For uploads the user-entered metadata
@@ -844,6 +966,7 @@ def add_job(job_id: str, out_dir: Path) -> dict:
     with open(out_dir / 'extraction_log.txt', 'a') as log:
         log.write(f'\n===== add run {job_id} {datetime.now().isoformat(timespec="seconds")} =====\n')
         status = ensure_features(scan, ser, jobs, True, log)
+        ensure_density(scan, ser, True, log)
     if status.startswith(('failed', 'skipped')):
         raise SystemExit(f'feature extraction: {status}')
 
@@ -858,6 +981,13 @@ def add_job(job_id: str, out_dir: Path) -> dict:
     # added from a different export folder still replaces its row — with the
     # scan folder as the fallback for anonymised headers.
     df = load_existing(out_dir)
+    if df is not None and not df.empty:
+        try:
+            df = carry_over_xlsx_edits(df, out_dir, STR_COLS)
+        except SystemExit as e:            # workbook/CSV rows differ — keep the CSV
+            print(f'  note: workbook edits not carried over ({e})')
+        except Exception as e:             # noqa: BLE001  (e.g. workbook open/locked)
+            print(f'  note: could not read the workbook ({e}); using the CSV')
     replaced = 0
     if df is not None and not df.empty:
         sid = str(row.get('study_id') or '').strip()
@@ -867,6 +997,28 @@ def add_job(job_id: str, out_dir: Path) -> dict:
         # A series dir can only ever describe one scan.
         same_scan |= df['roi_series_dir'].fillna('').astype(str) == str(row['roi_series_dir'])
         replaced = int(same_scan.sum())
+        if replaced:
+            prev = df[same_scan].iloc[0]
+            if 'half-cylinder' in str(prev.get('placement_method') or '') and \
+                    'half-cylinder' not in str(row.get('placement_method') or ''):
+                raise SystemExit(
+                    f'{prev.get("subject")} is measured with a half-cylinder ROI because the specimen is cut '
+                    'through the defect; a full-template web-app run would replace it. Re-place it with '
+                    'defect_segmentation/11_halfcut_exvivo_roi.py instead (spreadsheet unchanged).')
+            # Keep curated metadata the folder layout can't re-derive: a
+            # hand-entered treatment group and lab-sheet flags in the note.
+            pt = str(prev.get('treatment') or '')
+            pn = str(prev.get('note') or '')
+            # Ex vivo timepoints are curated from the lab sheets, not derivable from folders.
+            if pd.isna(row.get('timepoint_months')) and pd.notna(prev.get('timepoint_months')):
+                row['timepoint'] = prev.get('timepoint')
+                row['timepoint_months'] = prev.get('timepoint_months')
+            if pt and not pt.startswith('unknown') and (
+                    str(row.get('treatment') or '').startswith('unknown') or 'Label corrected' in pn):
+                row['treatment'] = pt
+            flags = ' — '.join(x for x in pn.split(' — ') if re.search(r'DUPLICATE|REPEAT SCAN|Label corrected|do not', x))
+            if flags and flags not in str(row.get('note') or ''):
+                row['note'] = flags + (' — ' + row['note'] if row.get('note') else '')
         df = df[~same_scan]
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True, sort=False)
     else:
