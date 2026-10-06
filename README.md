@@ -148,6 +148,39 @@ defect may be fully bridged — verify placement on the preview), `ring bone
 coverage`, and the tilt. `--fit-only JSON` and `--place-threshold` (geometry
 only, default 500 HU) are available.
 
+To see where the defect really is when a placement looks wrong, render the
+whole specimen top-down with the current ROI drawn on it:
+
+```bash
+python exvivo_overview.py --subjects 5788 5789   # or --all
+```
+
+### Ex vivo specimens cut through the defect (half-cylinder ROI)
+
+The 6-month UCLA specimens (5778–5790) are halved calvaria: the saw cut runs
+through the middle of the defect, so a full 10 mm template lands half in air.
+These get a **half-cylinder ROI**: the same template (half-disk core,
+half-annulus ring, 8 mm tall) on the specimen side of the cut, centred on the
+defect along the cut line.
+
+```bash
+python 11_halfcut_exvivo_roi.py                      # place all 13 + extract features
+python 11_halfcut_exvivo_roi.py --update-db          # ... and swap their spreadsheet rows
+python 11_halfcut_exvivo_roi.py --shift 5789 10 --update-db   # manual fix: slide along the cut (+ = up)
+```
+
+The cut is the straight edge of the specimen's mineralised footprint; the
+centre is found by a half-disk matched filter along it (within ±3 mm of the
+original placement when that was inside the specimen). Each series gets a
+`<series>_pose.json` (centre, axis, cut normal) that `6_extract_features.py`,
+`8_density_particles.py` and `axial_view.py` read. Only the union series is
+written — at 15 µm the per-region copies are ~1.3 GB each.
+
+**The web app cannot adjust half ROIs.** It only stamps full circles, so it
+refuses to re-run or adjust an outputs folder holding a `_pose.json`, and the
+spreadsheet refuses to replace a half-cylinder row with a full-template run.
+Use `--shift` above.
+
 ### Extracting Otsu + radiomic features
 
 Runs automatically after every web-app job; for a series produced on the
@@ -204,6 +237,74 @@ folder, which holds ROI series, never raw scans); it does not include scans
 that were uploaded through the app rather than archived — those enter the
 spreadsheet through their automatic web-app runs.
 
+> **Do not run a full rebuild onto the live spreadsheet.** Since ROI series
+> moved to `outputs/`, it finds only a fraction of the scans and drops
+> hand-curated metadata. Test with `--out` pointing at a scratch folder.
+
+Hand edits made in the workbook (treatment groups, ex vivo timepoints,
+lab-sheet notes) are carried over whenever the web app re-adds a row. Ex vivo
+timepoints come from the lab sheets: the #262 specimens are **6 months**,
+every other ex vivo scan is **3 months**.
+
+### Mineral density and particles (ex vivo)
+
+```bash
+python 8_density_particles.py --all      # every series in the database (skips current ones)
+python 8_density_particles.py --merge    # add the columns to the existing spreadsheet
+```
+
+An add-on to the features above, written to a separate
+`<series>_density.json` next to each series, so existing feature files,
+ROI series and database columns are never touched or re-extracted. The
+database gains `core_/ring_/core_to_ring_` columns for:
+
+- **density**: `bmd_mgha` (whole-region mean), `tmd_mgha` (mean above
+  226 mg HA/cm³) and `bvtv_226mgha`, in mg HA/cm³ from the SCANCO
+  calibration stored in each ex vivo DICOM.
+- **particles**: discrete mineralised pieces (residual scaffold, bone
+  islands). Gaussian σ 0.8 voxel, then a 226 mg HA/cm³ threshold,
+  26-connected, at least 0.01 mm³. The columns cover count, number density
+  (per mm³), volume distribution, equivalent diameter, per-particle density
+  and nearest-neighbour spacing.
+
+**Ex vivo only.** In vivo (SOFIE) scans carry no mineral calibration, so
+their columns are empty. At 100 µm, an in vivo particle count measured noise
+and fragmentation: on 2026-09-30 the empty-defect control 37951 scored more
+"particles" than scaffold-filled 37950. On SCANCO, the study's 226 HU
+threshold is only ≈ 24 mg HA/cm³ (soft tissue); 226 mg HA/cm³ is ≈ 1366 HU.
+`bvtv_fixed` keeps its 226 HU definition.
+
+`--merge` backs up the CSV and XLSX to `backup_<date>/` first. It also keeps
+hand edits made in the workbook (e.g. ex vivo treatment groups), which the
+CSV would otherwise overwrite. `7_build_database.py` reads the sidecars too,
+and web-app runs compute them automatically.
+
+### Group comparison figures (Defect vs C-OPG/SPDP-OPG vs Soaked-OPG)
+
+```bash
+python 9_opg_figures.py --images    # tables + figures; --images adds the scan panels (minutes)
+```
+
+Reads the spreadsheet only and writes two self-contained figure sets to
+`../figures/opg_comparison/in_vivo/` (3 and 6 months, HU) and `ex_vivo/`
+(6-month half-ROI specimens, mg HA/cm³): representative scans, bar graphs
+with ANOVA/Tukey brackets, trajectories (in vivo), z-scored feature heatmaps
+and a summary table, each as PDF + 600 dpi PNG/TIFF. Specimen-to-animal
+mapping and exclusions (lab sheets #182/#184/#262) are in `EXVIVO_ANIMALS` /
+`EXCLUDED`; the in vivo representative animals can be pinned in
+`9b_opg_scan_figure.py` (`IV_REPRESENTATIVE`).
+
+### Re-placing later timepoints by registration in bulk
+
+```bash
+python 10_replace_6m_by_registration.py --only MR52528 --update-db
+```
+
+Runs the web app's validated registration path (network hint → dice-gated
+rigid registration from the 3-month ROI, one rescue retry) for 6-month scans
+outside the app, writes a new `_6m_reg_output_dicom` series next to the old
+one, extracts features and swaps the spreadsheet row.
+
 ### Stamping at an explicit pose
 
 ```bash
@@ -258,8 +359,15 @@ automatically decimates ex vivo scans so memory stays manageable.
 3_inference.py           in vivo: predict + stamp the ROI template
 4_propagate_roi.py       in vivo: place later-timepoint ROIs by registration
 5_exvivo_roi.py          ex vivo: place the ROI geometrically (no network)
+11_halfcut_exvivo_roi.py ex vivo: half-cylinder ROI for specimens cut through the defect
+exvivo_overview.py       ex vivo: whole-specimen top-down maps with the current ROI
 stamp_roi.py             stamp the template at an explicit pose
+6_extract_features.py    Otsu + radiomic features (113 per region)
 7_build_database.py      study-wide radiomics spreadsheet (all scans, core/ring features)
+8_density_particles.py   ex vivo mineral density (mg HA/cm³) + particle analysis add-on
+9_opg_figures.py         Defect vs C-OPG/SPDP-OPG vs Soaked-OPG tables + figures
+9b_opg_scan_figure.py    representative-scan panels for those figure sets
+10_replace_6m_by_registration.py   bulk registration re-placement of 6-month ROIs
 webapp.py + webapp.html  local web app wrapping all of the above
 Launch Defect Segmenter.command   double-click launcher for the web app
 axial_view.py            reslice perpendicular to the fitted defect axis

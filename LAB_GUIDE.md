@@ -137,6 +137,11 @@ Three things to know before you use it:
 - A nudge is for **small** corrections (a millimetre or two). If the rings are
   far from the defect, the detection failed — re-run instead, and the app
   blocks nudges beyond 6 mm for exactly that reason.
+- **Cut ex vivo specimens (5778–5790) can't be nudged in the app.** Their
+  defect is cut in half, so they use a half-circle ROI that the app can't
+  draw; it refuses to re-run or adjust them. Slide one along the cut with
+  `python 11_halfcut_exvivo_roi.py --shift <specimen> <mm> --update-db`
+  (positive = toward the top of the view).
 
 ---
 

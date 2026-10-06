@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 # Root holding the per-group subject folders. Override with --base on another machine.
-BASE = Path('/Volumes/justinytlin/Craniofacial/Radiomics/In Vivo CT Data/PDLLA RAW DICOM VIVO DATA')
+BASE = Path(__file__).resolve().parent.parent   # the data archive this repo sits in
 
 SUBJECTS = [
     ('37951', 'Defect',       'Defect/3 MONTH/37951/dicom_t57860',
