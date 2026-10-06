@@ -100,6 +100,19 @@ class AxialView:
 
         self.center_mm, self.axis, self.eigvals = fit_axis(
             coords * self.native_spacing)
+        # Half-cylinder ROIs (cut ex vivo specimens) carry their pose in a
+        # sidecar: PCA on half a template is ill-posed.
+        self.cut_normal = None
+        pose_f = self.output_dir.parent / (self.output_dir.name + '_pose.json')
+        if pose_f.exists():
+            import json
+            pose = json.loads(pose_f.read_text())
+            self.center_mm = np.asarray(pose['center_mm'], float)
+            a = np.asarray(pose['axis'], float)
+            self.axis = a / np.linalg.norm(a)
+            if pose.get('cut_normal') is not None:
+                n = np.asarray(pose['cut_normal'], float)
+                self.cut_normal = n / np.linalg.norm(n)
         self.geom = OrientedCylinder(self.center_mm, self.axis, self.spacing)
 
         # ── Load only the CT subvolume the reslice can reach ─────────────────

@@ -148,6 +148,15 @@ def clear_outputs_folder(folder: Path):
         raise RuntimeError(f'refusing to clear {folder} — not under {OUTPUTS_DIR}')
     if not folder.is_dir():
         return
+    # Cut ex vivo specimens (#262) carry a half-cylinder ROI placed by
+    # 11_halfcut_exvivo_roi.py (marked by its _pose.json). A full-template
+    # re-run would silently delete it — refuse before touching anything.
+    half = [e.name for e in os.scandir(folder) if e.name.endswith('_pose.json')]
+    if half:
+        raise RuntimeError(
+            f'{folder.name} holds a half-cylinder ROI ({half[0][:-10]}) because the specimen is '
+            'cut through the defect; the web app only places full circles. Re-place it with '
+            'defect_segmentation/11_halfcut_exvivo_roi.py instead — nothing was changed.')
     for e in os.scandir(folder):
         if e.name.startswith('.'):
             continue                      # AppleDouble etc. — leave alone

@@ -95,9 +95,32 @@ def bin_volume(vol):
                    .astype(np.int16), 0, GLCM_BINS - 1)
 
 
+def pose_file(roi_dir: Path) -> Path:
+    return Path(roi_dir).parent / (Path(roi_dir).name + '_pose.json')
+
+
+def load_cut(roi_dir: Path):
+    """Unit normal of the cut plane for a half-cylinder ROI (points into the
+    kept half), or None for the standard full template."""
+    f = pose_file(roi_dir)
+    if not f.exists():
+        return None
+    n = json.loads(f.read_text()).get('cut_normal')
+    return None if n is None else np.asarray(n, float) / np.linalg.norm(n)
+
+
 def fit_pose_from_series(input_dir: Path, roi_dir: Path, spacing, orig_h):
     """Centre + axis of the stamped template, re-fitted from the union series
-    (same math as axial_view.AxialView, without loading any CT)."""
+    (same math as axial_view.AxialView, without loading any CT).
+
+    A <series>_pose.json next to the series (written for half-cylinder ROIs on
+    cut specimens, where PCA on a half template is ill-posed) takes precedence.
+    """
+    f = pose_file(roi_dir)
+    if f.exists():
+        d = json.loads(f.read_text())
+        a = np.asarray(d['axis'], float)
+        return np.asarray(d['center_mm'], float), a / np.linalg.norm(a)
     hdr_out = _INF.dcm_files_sorted(roi_dir)
     k = max(1, int(round(0.1 / float(min(spacing)))))
     ds_in0 = pydicom.dcmread(str(_INF.dcm_files_sorted(input_dir)[0][1]),
@@ -154,7 +177,7 @@ def load_working_volume(slices, spacing, orig_h, orig_w, center, axis):
     return vol, z_mm, r_mm, c_mm, voxel_mm
 
 
-def region_masks(z_mm, r_mm, c_mm, center, axis):
+def region_masks(z_mm, r_mm, c_mm, center, axis, cut=None):
     dz = (z_mm - center[0]).astype(np.float32)[:, None, None]
     dr = (r_mm - center[1]).astype(np.float32)[None, :, None]
     dc = (c_mm - center[2]).astype(np.float32)[None, None, :]
@@ -162,6 +185,8 @@ def region_masks(z_mm, r_mm, c_mm, center, axis):
     d2 = dz ** 2 + dr ** 2 + dc ** 2 - t ** 2
     d = np.sqrt(np.maximum(d2, 0.0))
     within = np.abs(t) <= _INF.CYL_HEIGHT_MM / 2.0
+    if cut is not None:                       # half-cylinder ROI (cut specimen)
+        within &= (dz * cut[0] + dr * cut[1] + dc * cut[2]) >= 0
     core = within & (d <= _INF.CYLINDER_MM)
     ring = within & (d >= _INF.RING_INNER_MM) & (d <= _INF.RING_OUTER_MM)
     return core, ring
@@ -652,7 +677,10 @@ def main():
     vol, z_mm, r_mm, c_mm, voxel_mm = load_working_volume(
         slices, spacing, ds0.Rows, ds0.Columns, center, axis)
     print(f'  {vol.shape} voxels at {tuple(round(v, 4) for v in voxel_mm)} mm')
-    core, ring = region_masks(z_mm, r_mm, c_mm, center, axis)
+    cut = load_cut(roi_dir)
+    if cut is not None:
+        print(f'  half-cylinder ROI, cut normal {np.round(cut, 3)}')
+    core, ring = region_masks(z_mm, r_mm, c_mm, center, axis, cut)
     voxel_mm3 = float(np.prod(voxel_mm))
     b = bin_volume(vol)
 
@@ -700,6 +728,8 @@ def main():
         'bone_threshold_hu': args.bone_threshold,
         'center_mm': [round(float(v), 3) for v in center],
         'axis': [round(float(v), 4) for v in axis],
+        'template': 'half cylinder (cut specimen)' if cut is not None else 'full cylinder',
+        'cut_normal': None if cut is None else [round(float(v), 4) for v in cut],
         'engine': 'numpy/scipy/scikit-image (pyradiomics unavailable on this '
                   'Python; IBSI-style definitions)',
     }
