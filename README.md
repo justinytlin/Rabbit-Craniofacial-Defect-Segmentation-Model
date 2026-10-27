@@ -279,7 +279,7 @@ hand edits made in the workbook (e.g. ex vivo treatment groups), which the
 CSV would otherwise overwrite. `7_build_database.py` reads the sidecars too,
 and web-app runs compute them automatically.
 
-### Group comparison figures (Defect vs C-OPG/SPDP-OPG vs Soaked-OPG)
+### Group comparison figures (Defect vs C-OPG vs Soaked-OPG)
 
 ```bash
 python 9_opg_figures.py --images    # tables + figures; --images adds the scan panels (minutes)
@@ -292,7 +292,27 @@ with ANOVA/Tukey brackets, trajectories (in vivo), z-scored feature heatmaps
 and a summary table, each as PDF + 600 dpi PNG/TIFF. Specimen-to-animal
 mapping and exclusions (lab sheets #182/#184/#262) are in `EXVIVO_ANIMALS` /
 `EXCLUDED`; the in vivo representative animals can be pinned in
-`9b_opg_scan_figure.py` (`IV_REPRESENTATIVE`).
+`9b_opg_scan_figure.py` (`IV_REPRESENTATIVE`). C-OPG and SPDP-OPG are the same
+treatment and are pooled and labelled "C-OPG".
+
+- **Bar graphs (Fig 2)** show a fixed three-part story, the same in every set
+  (`BAR_IV` / `BAR_EX`): defect : reference BV/TV (fill), BMD or mean HU
+  (mineral content) and, ex vivo only, mean particle volume (organisation).
+  Every metric stays in Table 1.
+- **Heatmaps** come from one shared function, `grouped_heatmap`: features as
+  rows grouped into families, rabbits as columns grouped by treatment, plus
+  group means. In vivo has one panel per timepoint on a shared z-scale
+  (`Fig4a`/`Fig4b`).
+
+```bash
+python 9c_exvivo_all_figures.py --images   # every OPG-study ex vivo specimen, all groups
+```
+
+Writes `../figures/opg_comparison/ex_vivo_all/` in the same style:
+- 3-month (lab sheets #182/#184) and 6-month (#262) specimens, one value per rabbit (repeat scans averaged; see `RABBITS`).
+- The CG groups are dropped (`DROP_GROUPS`).
+- Per-timepoint heatmaps (`Fig3a`/`Fig3b`).
+- An exploratory effect-size table, `Soaked-OPG_feature_ranking.csv`, with Hedges' g for every feature.
 
 ### Re-placing later timepoints by registration in bulk
 
@@ -365,7 +385,8 @@ stamp_roi.py             stamp the template at an explicit pose
 6_extract_features.py    Otsu + radiomic features (113 per region)
 7_build_database.py      study-wide radiomics spreadsheet (all scans, core/ring features)
 8_density_particles.py   ex vivo mineral density (mg HA/cm³) + particle analysis add-on
-9_opg_figures.py         Defect vs C-OPG/SPDP-OPG vs Soaked-OPG tables + figures
+9_opg_figures.py         Defect vs C-OPG vs Soaked-OPG tables + figures
+9c_exvivo_all_figures.py  all OPG-study ex vivo specimens, every group, same figure style
 9b_opg_scan_figure.py    representative-scan panels for those figure sets
 10_replace_6m_by_registration.py   bulk registration re-placement of 6-month ROIs
 webapp.py + webapp.html  local web app wrapping all of the above

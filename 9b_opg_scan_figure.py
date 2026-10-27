@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fig. 1 of each figure set — representative scans, Defect vs C-OPG/SPDP-OPG vs Soaked-OPG.
+"""Fig. 1 of each figure set — representative scans, Defect vs C-OPG vs Soaked-OPG.
 
   make_invivo : one MR525xx rabbit per group (closest to its group median of
                 in vivo defect:reference BV/TV and mean HU at 6 months), shown
@@ -177,7 +177,7 @@ def make_invivo(iv):
         f'In vivo µCT (100 µm) of one rabbit per group at 3 and 6 months. Top-down views are {IV_SLAB_MM:.0f} mm '
         'maximum-intensity slabs perpendicular to the fitted defect axis; the bottom row is a 6-month section containing '
         'the defect axis. Coloured solid circle/lines = 10 mm defect core ROI; white dashed = 14–18 mm reference ring. '
-        'Window 0–2400 HU, identical for all panels. Defect and C-OPG/SPDP-OPG: the MR525xx rabbit closest to its group median 6-month '
+        'Window 0–2400 HU, identical for all panels. Defect and C-OPG: the MR525xx rabbit closest to its group median 6-month '
         'defect:reference BV/TV and defect mean HU; Soaked-OPG: MR52527 (the same rabbit as ex vivo specimen 5787).')
     FIG.save(fig, 'Fig1_representative_scans', 'in_vivo')
     plt.close(fig)

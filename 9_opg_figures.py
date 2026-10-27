@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Defect vs C-OPG/SPDP-OPG vs Soaked-OPG — publication tables and figures.
+"""Defect vs C-OPG vs Soaked-OPG — publication tables and figures.
 
 Reads ../radiomics_database/radiomics_database.csv (never writes it) and
 builds an animal-level analysis set from EVERY scan of the three groups,
 with the lab-sheet corrections applied (2026-10-05):
 
-  * C-OPG and SPDP-OPG are the same treatment ("C-OPG/SPDP-OPG").
+  * C-OPG and SPDP-OPG are the same treatment; SPDP-OPG scans are pooled and labelled "C-OPG".
   * Ex vivo 2021 cohort (#182/#184 sheets) is NOT used (removed 2026-10-05 at
     the user's request): it had no plain C-OPG or S-OPG group, only Defect
     controls. Its low-res "C-OPG"/"Soaked-OPG" uploads 4131-4136 are
@@ -52,11 +52,11 @@ BASE = DATA_ROOT.parent                       # roi_series_dir / scan_dir are re
 DB_CSV = DATA_ROOT / 'radiomics_database' / 'radiomics_database.csv'
 OUT = DATA_ROOT / 'figures' / 'opg_comparison'
 
-GROUPS = ['Defect', 'C-OPG/SPDP-OPG', 'Soaked-OPG']
-GROUP_OF = {'Defect': 'Defect', 'C-OPG': 'C-OPG/SPDP-OPG', 'SPDP': 'C-OPG/SPDP-OPG',
-            'SPDP-OPG': 'C-OPG/SPDP-OPG', 'Soaked-OPG': 'Soaked-OPG'}
+GROUPS = ['Defect', 'C-OPG', 'Soaked-OPG']
+GROUP_OF = {'Defect': 'Defect', 'C-OPG': 'C-OPG', 'SPDP': 'C-OPG',
+            'SPDP-OPG': 'C-OPG', 'Soaked-OPG': 'Soaked-OPG'}
 # Validated categorical slots 1-3 (dataviz reference palette, all-pairs CVD-safe).
-COLOR = {'Defect': '#2a78d6', 'C-OPG/SPDP-OPG': '#eb6834', 'Soaked-OPG': '#1baf7a'}
+COLOR = {'Defect': '#2a78d6', 'C-OPG': '#eb6834', 'Soaked-OPG': '#1baf7a'}
 INK, INK2, MUTED, GRID, AXIS = '#0b0b0b', '#52514e', '#898781', '#e1e0d9', '#c3c2b7'
 DIVERGING = ['#184f95', '#3987e5', '#9ec5f4', '#f0efec', '#f2a7a6', '#e34948', '#a3292a']
 
@@ -65,10 +65,10 @@ EXVIVO_ANIMALS = {
     # 6-month UCLA cohort = in vivo MR525xx animals
     'x52523': ('6 months', 'Defect', ['5782']),          # 5783 = repeat scan, dropped
     'x52524': ('6 months', 'Defect', ['5784']),
-    'x52521': ('6 months', 'C-OPG/SPDP-OPG', ['5780']),
-    'x52522': ('6 months', 'C-OPG/SPDP-OPG', ['5781']),
-    'x52525': ('6 months', 'C-OPG/SPDP-OPG', ['5785']),
-    'x52526': ('6 months', 'C-OPG/SPDP-OPG', ['5786']),
+    'x52521': ('6 months', 'C-OPG', ['5780']),
+    'x52522': ('6 months', 'C-OPG', ['5781']),
+    'x52525': ('6 months', 'C-OPG', ['5785']),
+    'x52526': ('6 months', 'C-OPG', ['5786']),
     'x52527': ('6 months', 'Soaked-OPG', ['5787']),
     'x52528': ('6 months', 'Soaked-OPG', ['5788']),
     'x52529': ('6 months', 'Soaked-OPG', ['5789']),
@@ -101,6 +101,14 @@ IV_METRICS = [
     ('core_mean_hu', 'Defect mean density (HU)', 1),
     ('core_bone_mean_hu', 'Defect bone density (HU)', 1),
 ]
+# Fig 2 bar panels: a fixed three-part story, the same in every set (all metrics stay in Table 1).
+#   1. how much of the defect is filled  -> defect : reference BV/TV (primary endpoint)
+#   2. how much mineral it holds         -> BMD (ex vivo, calibrated) / mean density (in vivo, HU)
+#   3. how that mineral is organised     -> mean particle volume (ex vivo only; particles are noise at 100 µm)
+# In vivo bone density (HU) is left out: at 100 µm it rises with bone thickness (partial volume), and the
+# calibrated 15 µm ex vivo TMD shows no group difference, so it would suggest "denser bone" misleadingly.
+BAR_EX = [EX_METRICS[1], EX_METRICS[2], EX_METRICS[5]]
+BAR_IV = [IV_METRICS[1], IV_METRICS[2]]
 HEAT_COMMON = [
     ('mean_hu', 'Mean HU'), ('std_hu', 'SD HU'), ('p90_hu', 'P90 HU'),
     ('skewness', 'Skewness'), ('kurtosis', 'Kurtosis'), ('entropy_bits', 'Entropy'),
@@ -119,6 +127,24 @@ HEAT_EXVIVO = [
     ('particle_eqdiam_mean_mm', 'Particle diam.'), ('particle_largest_fraction', 'Largest particle frac.'),
     ('particle_mean_mgha', 'Particle density'), ('particle_nn_dist_mean_mm', 'Particle spacing'),
 ] + HEAT_COMMON
+
+# In vivo heatmap families (same layout and labels as the ex vivo all-specimen heatmaps;
+# particle features are ex vivo only, mg HA columns need the SCANCO calibration).
+IV_FAMILIES = [
+    ('Mineral amount', [('bvtv_fixed', 'BV/TV (226 HU)'), ('to_ring_bvtv_fixed', 'Defect : reference BV/TV'),
+                        ('mean_hu', 'Mean HU'), ('p90_hu', '90th percentile HU')]),
+    ('Mineral density', [('bone_mean_hu', 'Bone mean HU')]),
+    ('Mineral structure', [('bone_components', 'Bone components'),
+                           ('bone_volume_to_surface_mm', 'BV/BS (thickness)'),
+                           ('bone_sphericity', 'Sphericity'), ('bone_solidity', 'Solidity')]),
+    ('Intensity distribution', [('std_hu', 'SD HU'), ('skewness', 'Skewness'),
+                                ('kurtosis', 'Kurtosis'), ('entropy_bits', 'Entropy')]),
+    ('Texture', [('glcm_contrast', 'GLCM contrast'), ('glcm_homogeneity', 'GLCM homogeneity'),
+                 ('glcm_correlation', 'GLCM correlation'), ('glcm_entropy_bits', 'GLCM entropy'),
+                 ('glrlm_run_percentage', 'GLRLM run %'), ('glszm_zone_percentage', 'GLSZM zone %'),
+                 ('glszm_large_area_emphasis', 'GLSZM large area'),
+                 ('ngtdm_coarseness', 'NGTDM coarseness'), ('ngtdm_busyness', 'NGTDM busyness')]),
+]
 
 CAPTION_NOTES = {}
 MIN_CORE_IN_SPECIMEN = 0.5   # ex vivo: exclude cut specimens missing most of the defect
@@ -314,28 +340,28 @@ def legend_handles(include_cohort=True, hollow=False):
 
 def fig_exvivo_bars(exs):
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(2, 4, figsize=(7.09, 3.9))
+    fig, axes = plt.subplots(1, len(BAR_EX), figsize=(5.4, 2.3))
     exs = exs[exs.cohort == '6 months']
     slots = [('6 months', '6 months', exs.cohort == '6 months')]
-    for ax, (col, lab, sc), letter in zip(axes.flat, EX_METRICS, 'abcdefgh'):
+    for ax, (col, lab, sc), letter in zip(axes.flat, BAR_EX, 'abcdefgh'):
         c = bar_panel(ax, exs, col, sc, slots, lab)
         brackets(ax, c, '6 months', compare(exs[exs.cohort == '6 months'], col, sc))
         ax.set_ylim(bottom=min(0, ax.get_ylim()[0]))
         ax.text(-0.32, 1.04, letter, transform=ax.transAxes, fontsize=9, fontweight='bold')
     fig.legend(handles=legend_handles(include_cohort=False), loc='lower center', ncol=3, frameon=False,
-               bbox_to_anchor=(0.5, -0.04))
-    fig.tight_layout(rect=(0, 0.05, 1, 1), w_pad=1.2, h_pad=1.4)
+               bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=(0, 0.1, 1, 1), w_pad=1.6)
     save(fig, 'Fig2_bars', 'ex_vivo')
     plt.close(fig)
 
 
 def fig_invivo_bars(iv):
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 4, figsize=(7.09, 2.3))
+    fig, axes = plt.subplots(1, len(BAR_IV), figsize=(3.9, 2.3))
     slots = [(t, str(t), iv.timepoint_months == t) for t in IV_TIMEPOINTS]
     hollow = iv.placement.str.startswith('unvalidated')
     unval_t = sorted(iv.loc[hollow, 'timepoint_months'].unique())
-    for ax, (col, lab, sc), letter in zip(axes.flat, IV_METRICS, 'abcd'):
+    for ax, (col, lab, sc), letter in zip(axes.flat, BAR_IV, 'abcd'):
         c = bar_panel(ax, iv, col, sc, slots, lab, hollow_mask=hollow, hatch_slots=tuple(unval_t))
         for t in (3, 6):
             if t not in unval_t:
@@ -344,7 +370,7 @@ def fig_invivo_bars(iv):
         ax.set_xlabel('Months after surgery')
         ax.text(-0.3, 1.04, letter, transform=ax.transAxes, fontsize=9, fontweight='bold')
     fig.legend(handles=legend_handles(include_cohort=False, hollow=bool(unval_t)), loc='lower center',
-               ncol=3, frameon=False, bbox_to_anchor=(0.5, -0.12), columnspacing=1.5)
+               ncol=3, frameon=False, bbox_to_anchor=(0.5, -0.02), columnspacing=1.5)
     fig.tight_layout(rect=(0, 0.1, 1, 1), w_pad=1.4)
     save(fig, 'Fig2_bars', 'in_vivo')
     plt.close(fig)
@@ -449,6 +475,116 @@ def heatmap(frame, feats, row_label, strips, name, title_note, sub):
     fig.legend(handles=[Patch(color=COLOR[g], label=g) for g in GROUPS], loc='lower center',
                ncol=3, frameon=False, bbox_to_anchor=(0.5, 0.995), fontsize=6.5)
     save(fig, name, sub)
+    plt.close(fig)
+
+
+def grouped_heatmap(sub, groups, families, colors, labels, name, out_sub, ref, scale_note,
+                    id_col='animal', muted=('MC',)):
+    """Features (rows, grouped by family) x animals (columns, grouped by treatment);
+    right panel = group means. `sub` has one row per animal with a `group` column and
+    core_* feature columns; `ref` holds the rows whose mean/SD set the z-scale.
+    Layout is set in inches so every heatmap shares cell size, fonts and margins."""
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
+    from matplotlib.colors import LinearSegmentedColormap
+    sub = sub.reset_index(drop=True)
+    fams = [(fam, [(k, lab) for k, lab in feats if f'core_{k}' in sub]) for fam, feats in families]
+    # rows with a blank gap between families
+    rows, ypos, fam_spans, y = [], [], [], 0.0
+    for fam, feats in fams:
+        if not feats:
+            continue
+        y0 = y
+        for f in feats:
+            rows.append(f); ypos.append(y); y += 1
+        fam_spans.append((fam, y0, y - 1))
+        y += 0.45
+    ymax = y - 0.45 - 1
+    fcols = [f'core_{k}' for k, _ in rows]
+    X, R_ = sub[fcols].astype(float), ref[fcols].astype(float)
+    Z = ((X - R_.mean()) / R_.std(ddof=1).replace(0, np.nan)).clip(-2.5, 2.5)
+    # columns: animals grouped by treatment with a blank gap between groups
+    cols, xpos, x, gap = [], [], 0.0, 0.5
+    centres, bounds = {}, {}
+    for g in groups:
+        x0 = x
+        for i in sub.index[sub.group == g]:
+            cols.append(i); xpos.append(x); x += 1
+        centres[g] = (x0 + x - 1) / 2; bounds[g] = (x0 - 0.5, x - 0.5)
+        x += gap
+    width = x - gap
+    M = Z.groupby(sub.group).mean().reindex(groups)
+
+    # geometry (inches)
+    CW, RH = 0.155, 0.15                        # cell width / row height
+    FAM_W, LAB_W, GAP_HM, GAP_CB, CB_W = 0.78, 1.28, 0.16, 0.14, 0.07
+    L, R, TOP, BOT = 0.04, 0.62, 0.62, 0.62
+    hm_w, mn_w, h = width * CW, len(groups) * CW, (ymax + 1) * RH
+    W = L + FAM_W + LAB_W + hm_w + GAP_HM + mn_w + GAP_CB + CB_W + R
+    H = TOP + h + BOT
+    fig = plt.figure(figsize=(W, H))
+
+    def axes(x0, w, y0=BOT, hh=h):
+        return fig.add_axes([x0 / W, y0 / H, w / W, hh / H])
+    x_fam = L; x_lab = x_fam + FAM_W; x_hm = x_lab + LAB_W
+    x_mn = x_hm + hm_w + GAP_HM; x_cb = x_mn + mn_w + GAP_CB
+    afam, alab, ax, am = axes(x_fam, FAM_W), axes(x_lab, LAB_W), axes(x_hm, hm_w), axes(x_mn, mn_w)
+    for a_ in (afam, alab, ax, am):
+        a_.set_ylim(ymax + 0.5, -0.5); a_.axis('off')
+    afam.set_xlim(0, 1); alab.set_xlim(0, 1)
+    ax.set_xlim(-0.5, width - 0.5); am.set_xlim(-0.5, len(groups) - 0.5)
+    cmap = LinearSegmentedColormap.from_list('div', DIVERGING)
+    col = lambda z: '#ffffff' if np.isnan(z) else cmap((z + 2.5) / 5)
+
+    # cells
+    for ci, xp in zip(cols, xpos):
+        for yp, zv in zip(ypos, Z.loc[ci].to_numpy()):
+            ax.add_patch(plt.Rectangle((xp - 0.5, yp - 0.5), 1, 1, lw=0.5, ec='white', fc=col(zv)))
+    for gi, g in enumerate(groups):
+        for yp, zv in zip(ypos, M.loc[g].to_numpy()):
+            am.add_patch(plt.Rectangle((gi - 0.5, yp - 0.5), 1, 1, lw=0.5, ec='white', fc=col(zv)))
+
+    # row labels and family brackets
+    for (k, lab), yp in zip(rows, ypos):
+        alab.text(0.97, yp, lab, ha='right', va='center', fontsize=6, color=INK2)
+    for fam, y0, y1 in fam_spans:
+        afam.plot([0.9, 0.9], [y0 - 0.38, y1 + 0.38], color=INK2, lw=1.0, solid_capstyle='butt')
+        afam.text(0.84, (y0 + y1) / 2, fam.replace(' ', '\n', 1), ha='right', va='center', fontsize=6,
+                  fontweight='bold', color=INK2, linespacing=1.1)
+
+    # column headers
+    def header(a_, x0, x1, xc, g, text=True):
+        a_.add_patch(plt.Rectangle((x0, -1.05), x1 - x0, 0.42, fc=colors[g], ec='none', clip_on=False))
+        if text:
+            a_.text(xc, -1.25, labels[g], ha='center', va='bottom', fontsize=6, fontweight='bold',
+                    color=INK2 if g in muted else colors[g], clip_on=False)
+    for g in groups:
+        header(ax, bounds[g][0] + 0.05, bounds[g][1] - 0.05, centres[g], g)
+    for gi, g in enumerate(groups):
+        header(am, gi - 0.45, gi + 0.45, gi, g, text=False)
+    ax.text((width - 1) / 2, -2.35, 'Individual rabbits', ha='center', va='bottom', fontsize=6.5,
+            fontweight='bold', clip_on=False)
+    am.text((len(groups) - 1) / 2, -2.35, 'Group mean', ha='center', va='bottom', fontsize=6.5,
+            fontweight='bold', clip_on=False)
+    # bottom labels: animal IDs and group names
+    for ci, xp in zip(cols, xpos):
+        ax.text(xp, ymax + 0.75, sub[id_col][ci], rotation=90, ha='center', va='top', fontsize=5,
+                color=INK2, clip_on=False)
+    for gi, g in enumerate(groups):
+        am.text(gi, ymax + 0.75, labels[g], rotation=90, ha='center', va='top', fontsize=5.5,
+                color=INK2, clip_on=False)
+
+    # colour bar, top-aligned
+    cb_h = min(h, 1.6)
+    cax = axes(x_cb, CB_W, BOT + h - cb_h, cb_h)
+    cb = fig.colorbar(mpl.cm.ScalarMappable(norm=mpl.colors.Normalize(-2.5, 2.5), cmap=cmap), cax=cax,
+                      ticks=[-2, -1, 0, 1, 2])
+    cb.outline.set_visible(False)
+    cb.set_label('z-score', fontsize=6, labelpad=2)
+    cb.ax.tick_params(labelsize=5.5, length=2, width=0.5)
+    cax.text(0.5, -0.06, scale_note, transform=cax.transAxes, ha='left', va='top', fontsize=5,
+             color=INK2, clip_on=False)
+    save(fig, name, out_sub)
     plt.close(fig)
 
 
@@ -587,16 +723,19 @@ def main():
             'White cell = not defined (fewer than two particles).', 'ex_vivo')
     ivh = iv[iv.feature_voxel_mm == 0.1].copy()          # same voxel size only (texture comparability)
     ivh['gi'] = ivh.group.map({g: i for i, g in enumerate(GROUPS)})
-    ivh = ivh.sort_values(['gi', 'timepoint_months', 'animal']).reset_index(drop=True)
-    ivh['row'] = ivh.animal + ' · ' + ivh.timepoint_months.astype(str) + ' mo' + \
-        np.where(ivh.placement.str.startswith('unvalidated'), ' †', '')
-    heatmap(ivh, HEAT_COMMON, 'row',
-            [('group', gcol, 'Group'),
-             ('timepoint_months', {3: '#9ec5f4', 6: '#184f95'}, 'Timepoint')],
-            'Fig4_heatmap',
-            'In vivo defect core, one row per scan; values z-scored per feature across scans (timepoint strip: light = 3 months, dark = 6 months).'
-            + (' † ROI placed by raw network inference (unvalidated).' if iv.placement.str.startswith('unvalidated').any() else '')
-            , 'in_vivo')
+    ivh = ivh.sort_values(['gi', 'animal']).reset_index(drop=True)
+    ivh['label'] = ivh.animal + np.where(ivh.placement.str.startswith('unvalidated'), ' †', '')
+    for t in IV_TIMEPOINTS:
+        name = f'Fig4{"ab"[IV_TIMEPOINTS.index(t)]}_heatmap_{t}mo'
+        # one z-scale over all in vivo scans (both timepoints), so 3- and 6-month panels are comparable
+        grouped_heatmap(ivh[ivh.timepoint_months == t], GROUPS, IV_FAMILIES, COLOR, {g: g for g in GROUPS},
+                        name, 'in_vivo', ivh, 'Scaled per\nfeature across\nall in vivo scans\n(3 and 6 months)',
+                        id_col='label')
+        CAPTION_NOTES[f'in_vivo/{name}'] = (
+            f'In vivo defect core at {t} months, one column per rabbit; values z-scored per feature across all '
+            'in vivo scans at both timepoints, so colours are comparable between the 3- and 6-month panels.'
+            + (' † ROI placed by raw network inference (unvalidated).'
+               if iv.placement.str.startswith('unvalidated').any() else ''))
 
     if args.images:
         _img = importlib.util.spec_from_file_location('_img', REPO_DIR / '9b_opg_scan_figure.py')
