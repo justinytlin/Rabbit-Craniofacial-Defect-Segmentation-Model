@@ -15,3 +15,10 @@ logs/
 
 # Redundant checkpoint (keep only best_model.pth)
 models/last_model.pth
+
+# Radiomics spreadsheet: the live CSV/XLSX are tracked (every update is a
+# commit); the dated on-disk backups and the extraction log are not.
+radiomics_database/backup_*/
+radiomics_database/pre_manual_review_*/
+radiomics_database/extraction_log.txt
+radiomics_database/._*

@@ -83,6 +83,25 @@ The **Advanced** panel keeps the fully manual run (explicit mode, reference,
 threshold, overwrite). Run history and logs persist in `logs/webapp/`. To
 share one instance on the lab network: `python3 webapp.py --host 0.0.0.0`.
 
+**Dr. Ren's in vitro scaffold scans** (`Radiomics/Dr. Ren/`, nanogold-labelled
+hMSCs on 6–8 mm CG / MC / PEG-MC scaffolds, SCANCO 37 µm) are supported too,
+but they are a different experiment: there is no calvarial defect, so no ROI
+template is placed. The app recognises them (by location in that folder, by
+their scanner StudyID once indexed, or by the "Nanogold" PatientName on an
+upload) and runs `12_scaffold_gold.py` instead, which re-uses the study's own
+`Dr. Ren/analysis/microct_pipeline.py` on the one scan: scaffold envelope,
+floor cut, per-slice baseline, gold = baseline + 5σ (the threshold calibrated
+on the study's unlabeled controls). Results go to
+`Dr. Ren/outputs/<scan>_scaffold/` (JSON, metrics CSV for every threshold,
+depth profile, QC overlay). Each passed run is added automatically to the
+**`scaffold` tab** of `radiomics_database/radiomics_database.xlsx` (mirrored
+in `scaffold_database.csv`, described in the `scaffold_dictionary` tab) —
+one row per scan, keyed by scan id / StudyID, with the manifest identity
+(run, scaffold, labelling, cells), the primary k = 5 metrics, the study's
+flags and the k = 4 / k = 6 / fixed-3000 sensitivity values. It is a separate
+experiment, so it never touches the `database` sheet. The folder browser has
+a chip to jump to the Dr. Ren root.
+
 ## Command line
 
 ### In vivo, 3-month scan
@@ -181,6 +200,30 @@ refuses to re-run or adjust an outputs folder holding a `_pose.json`, and the
 spreadsheet refuses to replace a half-cylinder row with a full-template run.
 Use `--shift` above.
 
+### In vitro scaffold scan (Dr. Ren nanogold study)
+
+```bash
+python 12_scaffold_gold.py --input "…/Dr. Ren/286/6064" \
+    --output "…/Dr. Ren/outputs/6064_scaffold/6064_scaffold"
+```
+
+Same numbers as the study report (`Dr. Ren/REPORT.md`, 2026-10-26) for that
+scan: gold fraction of scaffold, D50 / D90 / mean depth from the seeded top
+surface, fraction within 0.25 mm and deeper than 1 mm, deep gold density,
+radial position, cluster statistics — at the primary threshold (baseline +
+5σ) and at every fixed / adaptive threshold the study computed. Sample
+identity (run, scaffold, labelling, cells) comes from
+`Dr. Ren/analysis/manifest.csv`; `--meta` passes user-entered metadata for a
+scan that is not listed. Flags follow `group_stats.py` (thin VOI, top cut,
+floor gold, bottom gold) plus the 0.02 % control ceiling. ~4 s per scan.
+Group-level statistics still come from the study's own
+`analysis/group_stats.py`, not from this script.
+
+Spreadsheet: `python 7_build_database.py --add-scaffold-job JOB_ID [--add-scaffold-job …]`
+upserts finished web-app scaffold runs into the `scaffold` tab (the web app
+does this itself after every passed run). Hand edits to the identity / note
+columns of that tab are kept; the numbers always come from the run.
+
 ### Extracting Otsu + radiomic features
 
 Runs automatically after every web-app job; for a series produced on the
@@ -208,6 +251,18 @@ near −300 HU), not bone from soft tissue, which is why the fixed-threshold
 BV/TV remains the headline number.
 
 ### Building the study-wide radiomics database
+
+The spreadsheet lives **inside this repository** at
+`defect_segmentation/radiomics_database/` (`radiomics_database.xlsx` +
+`.csv`, `scaffold_database.csv`) and is git-versioned: every time a run
+is added — automatically by the web app, or with `--add-job` /
+`--add-scaffold-job` — the writer commits the three files and pushes to
+GitHub (`--no-commit` skips that; a failed push keeps the commit local).
+After editing the workbook by hand, commit it with
+`python 7_build_database.py --commit-database`. The dated `backup_*/`
+folders stay on disk but are not tracked — git history is the backup.
+`…/PDLLA RAW DICOM VIVO DATA/radiomics_database` is a symlink to the repo
+folder, so older paths still work.
 
 ```bash
 python 7_build_database.py            # add --no-extract to re-assemble without extracting

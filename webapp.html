@@ -127,7 +127,7 @@
 <body>
 <header>
   <h1>Rabbit Calvarial Defect Segmentation</h1>
-  <div class="sub">U-Net detection &middot; rigid ROI template &middot; registration placement for later timepoints</div>
+  <div class="sub">U-Net detection &middot; rigid ROI template &middot; registration placement for later timepoints &middot; in vitro scaffold gold quantification</div>
 </header>
 
 <main>
@@ -141,7 +141,9 @@
       <div class="small">or click to choose folders of .dcm slices — one scan or a
         whole batch.<br>
         Each scan becomes a queued job; jobs run one after another, so you can
-        drop an evening's worth and leave it overnight.</div>
+        drop an evening's worth and leave it overnight.<br>
+        Rabbit defect scans (in vivo or ex vivo) and Dr. Ren's in vitro scaffold
+        scans are told apart automatically.</div>
     </div>
     <input type="file" id="filepick" webkitdirectory multiple style="display:none">
     <div class="progress" id="progress">
@@ -174,6 +176,9 @@
       <label class="radio"><input type="radio" name="mode" value="exvivo">
         <span><b>Ex vivo specimen</b> — geometric placement (no network)<br>
         <span class="modehelp">For excised-calvaria µCT scans (SCANCO, ~15 µm): the defect is located from the specimen itself. Auto-selected when such a scan is recognised.</span></span></label>
+      <label class="radio"><input type="radio" name="mode" value="scaffold">
+        <span><b>In vitro scaffold</b> — gold-labelled cell quantification (no ROI)<br>
+        <span class="modehelp">For Dr. Ren's nanogold scaffold µCT (6–8 mm scaffolds, 37 µm): scaffold envelope, depth of the gold label from the seeded surface — no defect template. Auto-selected for scans in the Dr. Ren folder.</span></span></label>
 
       <div id="refBlock" style="display:none">
         <label>Reference 3-month scan (DICOM folder)</label>
@@ -241,6 +246,7 @@
       <div>
         <h1 style="font-size:14px" id="mTitle">Choose a folder</h1>
         <div class="path" id="mPath"></div>
+        <div class="chips" id="mRoots" style="margin-top:6px"></div>
       </div>
     </header>
     <div class="list" id="mList"></div>
@@ -290,6 +296,7 @@
         <option value="auto">auto-detect (recommended)</option>
         <option value="invivo">in vivo</option>
         <option value="exvivo">ex vivo specimen</option>
+        <option value="scaffold">in vitro scaffold (gold-labelled cells)</option>
       </select>
       <label>Notes (optional)</label>
       <input type="text" id="metaNotes" placeholder="anything worth recording about this scan">
@@ -304,7 +311,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-let DATA_ROOT = null, selectedJob = null, logLen = 0, browseTarget = null, browsePath = null;
+let DATA_ROOT = null, ROOTS = [], selectedJob = null, logLen = 0, browseTarget = null, browsePath = null;
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -317,6 +324,7 @@ async function api(path, opts) {
 (async () => {
   const cfg = await api('/api/config');
   DATA_ROOT = cfg.data_root;
+  ROOTS = cfg.roots || [cfg.data_root];
   $('bone_threshold').value = cfg.bone_threshold;
   refreshJobs();
   setInterval(refreshJobs, 2500);
@@ -370,8 +378,9 @@ async function handleScanFiles(all) {
   // not an ROI output series) becomes one queued job — so a whole night's
   // worth of scans can be dropped in one go. If nothing passes the size bar
   // (a small test scan), fall back to the single largest folder.
+  // (≥ 30: rabbit scans have 1200 slices, Dr. Ren's scaffold stacks 79–135.)
   let scans = Object.entries(byDir)
-    .filter(([dir, list]) => list.length >= 100 && !dir.includes('output_dicom'))
+    .filter(([dir, list]) => list.length >= 30 && !dir.includes('output_dicom'))
     .sort((a, b) => a[0].localeCompare(b[0]));
   if (!scans.length) {
     let best = ['', []];
@@ -473,7 +482,7 @@ function askScanMeta(probe, folderName) {
   $('metaTreatment').value = '';
   $('metaTreatmentOther').style.display = 'none';
   $('metaTreatmentOther').value = '';
-  $('metaScanType').value = 'auto';
+  $('metaScanType').value = probe.scaffold_guess ? 'scaffold' : 'auto';
   $('metaNotes').value = '';
   $('metaOverlay').classList.add('show');
   $('metaSample').focus();
@@ -508,13 +517,16 @@ async function suggest() {
   try {
     const s = await api('/api/suggest?input=' + encodeURIComponent(p));
     const chips = [];
-    if (s.subject)   chips.push(`Subject <b>${s.subject}</b>`);
+    if (s.scaffold)  chips.push('<b>In vitro scaffold</b> (Dr. Ren)');
+    if (s.subject)   chips.push(`${s.scaffold ? 'Scan' : 'Subject'} <b>${s.subject}</b>`);
     if (s.group)     chips.push(`Group <b>${s.group}</b>`);
-    if (s.timepoint) chips.push(`Timepoint <b>${s.timepoint}</b>`);
+    if (s.timepoint) chips.push(`${s.scaffold ? '' : 'Timepoint '}<b>${s.timepoint}</b>`);
+    if (s.scaffold && !s.manifest) chips.push('<span style="background:#fef3c7">not in the study manifest — labelling unknown</span>');
     chips.push(`<b>${s.n_dcm}</b> DICOM slices`);
     $('ctxChips').innerHTML = chips.map(c => `<span class="chip">${c}</span>`).join('');
     if (s.suggested_output && !$('output').value) $('output').value = s.suggested_output;
-    if (s.exvivo) setMode('exvivo');
+    if (s.scaffold) setMode('scaffold');
+    else if (s.exvivo) setMode('exvivo');
     else if (s.is_3m === true) setMode('3m');
     else if (s.is_3m === false) {
       setMode('later_reg');
@@ -587,6 +599,7 @@ async function refreshJobs() {
 const modeName = m => ({'3m': '3-month, network placement',
   later_reg: 'registration placement', later_raw: 'RAW network placement',
   exvivo: 'ex vivo geometric placement',
+  scaffold: 'scaffold gold quantification',
   manual: 'manual adjustment'}[m] || m);
 
 function selectJob(id) {
@@ -613,15 +626,16 @@ async function pollDetail(force) {
   const finished = (j.status || '').startsWith('done');
   $('dlBtn').style.display = finished ? '' : 'none';
   if (finished) $('dlBtn').href = `/api/jobs/${j.id}/download`;
-  $('adjBtn').style.display = finished ? '' : 'none';
+  $('adjBtn').style.display = (finished && j.mode !== 'scaffold') ? '' : 'none';
   renderDatabase(j, finished);
   lastJob = j;
   if (changed('context', [j.context, j.placement_note, j.params])) {
     const chips = [];
     const c = j.context || {};
-    if (c.subject)   chips.push(`Subject <b>${c.subject}</b>`);
+    if (c.scaffold)  chips.push('<b>In vitro scaffold</b> (Dr. Ren)');
+    if (c.subject)   chips.push(`${c.scaffold ? 'Scan' : 'Subject'} <b>${c.subject}</b>`);
     if (c.group)     chips.push(`Group <b>${c.group}</b>`);
-    if (c.timepoint) chips.push(`Timepoint <b>${c.timepoint}</b>`);
+    if (c.timepoint) chips.push(`${c.scaffold ? '' : 'Timepoint '}<b>${c.timepoint}</b>`);
     if (j.placement_note) chips.push(j.placement_note);
     if (j.params && j.params.output) chips.push(`Output: ${j.params.output.split('/').pop()}`);
     $('dContext').innerHTML = chips.map(x => `<span class="chip">${x}</span>`).join('');
@@ -633,7 +647,25 @@ async function pollDetail(force) {
 // this line just reports what happened (identity of the row, or the error).
 function renderDatabase(j, finished) {
   const line = $('dDatabase');
-  if (!changed('database', [j.database, j.database_error, j.status])) return;
+  if (!changed('database', [j.database, j.database_error, j.status, j.mode])) return;
+  if (j.mode === 'scaffold') {
+    const d = j.database;
+    line.style.display = '';
+    if (d && d.added) {
+      line.innerHTML = `<span style="color:var(--pass)">&#10003; in spreadsheet</span> — <b>scaffold</b> tab (Dr. Ren's in vitro scans, separate from the in vivo / ex vivo rows), row <b>${d.scan}</b>` +
+        (d.run ? ` (${d.run} ${d.scaffold || ''} ${d.labeled || ''})` : '') +
+        ` &middot; ${d.n_scaffold} scaffold scans in the tab &middot; updated ${new Date(d.added * 1000).toLocaleString()} &middot; <code>${(d.xlsx || '').split('/').slice(-2).join('/')}</code>`;
+    } else if (j.database_error) {
+      line.innerHTML = `<span style="color:#b42318">Could not add to the scaffold tab: ${j.database_error}</span> — see the console log. The run itself is unaffected.`;
+    } else if (j.status === 'done_fail') {
+      line.textContent = 'Not added to the scaffold tab — a sanity check failed.';
+    } else if (finished) {
+      line.textContent = 'Adding to the scaffold tab of the spreadsheet automatically…';
+    } else {
+      line.style.display = 'none';
+    }
+    return;
+  }
   const d = j.database;
   if (d && d.added) {
     line.style.display = '';
@@ -790,6 +822,7 @@ function renderChecks(j) {
 function renderResults(j) {
   if (!changed('results', [j.results, j.metrics])) return;
   const el = $('dResults'), r = j.results, m = j.metrics || {};
+  if (r && r.scaffold) { el.innerHTML = renderScaffold(r.scaffold); return; }
   let html = '';
   const met = [];
   const hint = j.mode === 'later_reg' ? ' (detection hint)' : '';
@@ -846,10 +879,54 @@ function renderResults(j) {
   el.innerHTML = html;
 }
 
+function renderScaffold(s) {
+  const g = s.geometry || {}, p = s.primary || {}, meta = s.meta || {};
+  const f = (x, d, suf) => (x == null || !isFinite(x)) ? '—' : x.toFixed(d) + (suf || '');
+  const pct = x => (x == null || !isFinite(x)) ? '—' : (100 * x).toFixed(0) + '%';
+  let html = `<div class="hero">
+    <div class="metric"><div class="k">Gold fraction of scaffold &middot; baseline + ${meta.k}σ</div>
+      <div class="v">${f(p.gold_frac_pct, 3, '%')}</div></div>
+    <div class="metric"><div class="k">D50 depth</div><div class="v">${f(p.D50_mm, 2, ' mm')}</div></div>
+    <div class="metric"><div class="k">Within 0.25 mm of surface</div><div class="v">${pct(p.frac_surface)}</div></div>
+  </div>`;
+  const met = [
+    ['Gold volume', f(p.gold_volume_mm3, 4, ' mm³')],
+    ['D90 depth', f(p.D90_mm, 2, ' mm')],
+    ['Mean depth', f(p.mean_depth_mm, 2, ' mm')],
+    ['Deeper than 1 mm', pct(p.frac_deeper_1mm)],
+    ['Gold density > 1 mm', f(p.deep_density_pct, 4, '%')],
+    ['Mean radial position', f(p.mean_rnorm, 2) + ' <span style="color:var(--muted)">(0 centre, 1 edge)</span>'],
+    ['Core fraction (r &lt; 0.5)', pct(p.frac_core)],
+    ['Clusters', p.n_clusters == null ? '—' : p.n_clusters.toLocaleString()],
+    ['Largest cluster', pct(p.largest_cluster_frac)],
+    ['Scaffold volume', f(g.scaffold_volume_mm3, 1, ' mm³')],
+    ['Analysed depth', f(g.analysed_thickness_mm, 2, ' mm')],
+    ['Gold threshold', `${f(p.T, 0)} raw <span style="color:var(--muted)">(mode ${f(g.mode, 0)}, σ ${f(g.sigma, 0)})</span>`],
+  ];
+  html += '<h2 style="margin-top:14px">Gold label</h2><div class="metrics">' +
+    met.map(([k, v]) => `<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('') + '</div>';
+  if (s.thresholds && s.thresholds.length) {
+    html += '<table><tr><th>Threshold</th><th>Raw T</th><th>Gold %</th><th>D50 mm</th><th>≤ 0.25 mm</th><th>&gt; 1 mm</th></tr>' +
+      s.thresholds.map(t => `<tr${t.kind === 'adaptive' && t.k === meta.k ? ' style="font-weight:600"' : ''}>
+        <td>${t.kind === 'fixed' ? 'fixed' : 'baseline + ' + t.k + 'σ'}</td><td>${f(t.T, 0)}</td>
+        <td>${f(t.gold_frac_pct, 4)}</td><td>${f(t.D50_mm, 2)}</td><td>${pct(t.frac_surface)}</td><td>${pct(t.frac_deeper_1mm)}</td></tr>`).join('') +
+      '</table>';
+  }
+  html += `<div class="note">Gold = voxels above the per-slice scaffold baseline + k·σ inside the scaffold
+    envelope (floor plane excluded); depth is measured from the seeded top surface of each column.
+    k = ${meta.k} is the threshold calibrated on the study's unlabeled controls (control ceiling
+    ${meta.control_ceiling_pct}% of scaffold volume). Compare these numbers only with other scaffold runs
+    at the same k — nothing here relates to a rabbit-defect BV/TV. Voxels ${(meta.voxel_mm || []).map(v => v.toFixed(3)).join('×')} mm.</div>`;
+  return html;
+}
+
 function renderPreview(j) {
-  if (!changed('preview', j.preview)) return;
+  if (!changed('preview', [j.preview, j.mode])) return;
+  const title = j.mode === 'scaffold'
+    ? 'QC overlay — coronal · sagittal (cyan = floor cut) · axial gold projection · depth histogram'
+    : 'Axial view (⊥ to fitted axis)';
   $('dPreview').innerHTML = j.preview
-    ? `<h2 style="margin-top:14px">Axial view (⊥ to fitted axis)</h2>
+    ? `<h2 style="margin-top:14px">${title}</h2>
        <img class="preview" src="/api/image?path=${encodeURIComponent(j.preview)}">`
     : '';
 }
@@ -861,6 +938,9 @@ async function openBrowser(target) {
     ref_input: 'Choose the reference 3-month scan folder',
     ref_roi: 'Choose the reference 3-month ROI folder'}[target] || 'Choose a folder';
   const start = $(target).value.trim();
+  $('mRoots').innerHTML = ROOTS.length > 1
+    ? ROOTS.map(r => `<span class="chip" style="cursor:pointer" onclick="browseTo('${esc(r)}')">📁 ${r.split('/').pop()}</span>`).join('')
+    : '';
   $('overlay').classList.add('show');
   await browseTo(start || DATA_ROOT);
 }

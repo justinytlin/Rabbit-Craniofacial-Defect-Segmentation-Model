@@ -361,7 +361,7 @@ def main():
     p.add_argument('--force', action='store_true', help='recompute even if the sidecar is current')
     p.add_argument('--merge', action='store_true', help='add sidecar columns to the database')
     p.add_argument('--db', default=os.environ.get(
-        'DEFECT_DB_DIR', str(db.DATA_ROOT / 'radiomics_database')))
+        'DEFECT_DB_DIR', str(db.DB_DIR)))
     p.add_argument('--min-particle-mm3', type=float, default=MIN_PARTICLE_MM3)
     args = p.parse_args()
 

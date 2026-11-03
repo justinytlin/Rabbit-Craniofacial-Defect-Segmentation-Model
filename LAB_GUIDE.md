@@ -54,6 +54,34 @@ You can drop the whole subject folder if that's easier — the app finds the
 raw scan inside it. You can also drop **several scan folders at once** (or a
 folder containing many scans): each becomes its own queued job.
 
+## Dr. Ren's scaffold scans (in vitro)
+
+The scans under `Radiomics/Dr. Ren/` (folders `286`–`289`, one scan per
+numbered subfolder) are **not** rabbit defects: they are 6–8 mm scaffolds
+seeded with gold-labelled cells. Drop them in exactly the same way. The app
+recognises them and, instead of placing an ROI, measures the gold label:
+how much of the scaffold is gold, how deep it sits below the seeded surface
+(D50, fraction within 0.25 mm, fraction deeper than 1 mm), where it sits
+radially, and cluster counts. The QC picture shows coronal and sagittal
+sections with gold in orange and the floor cut in cyan, plus a depth
+histogram.
+
+* The run badge is PASSED when the stack is long enough (≥ 2 mm analysed),
+  the dome is not cut at the top, and the gold level makes sense for what
+  the manifest says the scan is (controls at or below 0.02 % of scaffold,
+  labelled scaffolds above it). Warnings explain any exception.
+* Results land in `Dr. Ren/outputs/<scan>_scaffold/` and in the results zip,
+  and every passed run goes into the **`scaffold` tab** of
+  `radiomics_database.xlsx` (one row per scan; re-running a scan replaces its
+  row). The `scaffold_dictionary` tab explains the columns. These rows never
+  mix with the in vivo / ex vivo rows of the `database` tab — it is a
+  different experiment.
+* A scan the app cannot match to Dr. Ren's manifest still runs, but its
+  labelling is unknown — enter the sample name in the form that appears and
+  pick "in vitro scaffold" as the scan type if it was not pre-selected.
+* In the Advanced panel's folder browser, click the **Dr. Ren** chip to
+  jump to that folder.
+
 ## Running a batch overnight
 
 Drop everything you want processed — the jobs queue up and run **one after

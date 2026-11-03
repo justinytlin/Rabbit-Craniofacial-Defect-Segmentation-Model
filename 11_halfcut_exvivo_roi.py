@@ -277,7 +277,7 @@ def contact_sheet(subjects):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import matplotlib.image as mi
-    df = pd.read_csv(REPO.parent / 'radiomics_database' / 'radiomics_database.csv', dtype={'subject': str})
+    df = pd.read_csv(REPO / 'radiomics_database' / 'radiomics_database.csv', dtype={'subject': str})
     pngs = []
     for s in subjects:
         r = df[(df.scan_type == 'ex vivo') & (df.subject == s)].iloc[0]
@@ -301,7 +301,7 @@ def contact_sheet(subjects):
 
 def update_db(results):
     db = _load('_db', '7_build_database.py')
-    out_dir = db.DATA_ROOT / 'radiomics_database'
+    out_dir = db.DB_DIR
     df = db.load_existing(out_dir)
     df = db.carry_over_xlsx_edits(df, out_dir, db.STR_COLS)
     n = 0
@@ -352,7 +352,7 @@ def main():
     ap.add_argument('--shift', nargs=2, metavar=('SUBJECT', 'MM'),
                     help='slide that specimen\'s half ROI along the cut (+ = toward the top of the views)')
     a = ap.parse_args()
-    df = pd.read_csv(REPO.parent / 'radiomics_database' / 'radiomics_database.csv', dtype={'subject': str})
+    df = pd.read_csv(REPO / 'radiomics_database' / 'radiomics_database.csv', dtype={'subject': str})
     if a.shift:
         logf = REPO / 'logs' / f'halfcut_shift_{datetime.now():%Y%m%d_%H%M}.log'
         with open(logf, 'w') as log:

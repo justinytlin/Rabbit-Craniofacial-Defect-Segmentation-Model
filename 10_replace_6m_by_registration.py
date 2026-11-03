@@ -108,7 +108,7 @@ def place(animal, df, base, log):
 
 
 def update_db(results, db, dp, base):
-    out_dir = db.DATA_ROOT / 'radiomics_database'
+    out_dir = db.DB_DIR
     df = db.load_existing(out_dir)
     df = dp.carry_over_xlsx_edits(df, out_dir, db.STR_COLS)
     n = 0
@@ -164,7 +164,7 @@ def main():
     db = _load('_db', '7_build_database.py')
     dp = _load('_dp', '8_density_particles.py')
     base = db.DATA_ROOT.parent
-    df = pd.read_csv(db.DATA_ROOT / 'radiomics_database' / 'radiomics_database.csv', dtype={'subject': str})
+    df = pd.read_csv(db.DB_DIR / 'radiomics_database.csv', dtype={'subject': str})
     logf = REPO / 'logs' / f'replace_6m_{datetime.now():%Y%m%d_%H%M}.log'
     logf.parent.mkdir(exist_ok=True)
     results = []

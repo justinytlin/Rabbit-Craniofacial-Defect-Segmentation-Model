@@ -88,7 +88,7 @@ def main():
     ap.add_argument('--subjects', nargs='*')
     ap.add_argument('--all', action='store_true')
     a = ap.parse_args()
-    df = pd.read_csv(REPO.parent / 'radiomics_database' / 'radiomics_database.csv', dtype={'subject': str})
+    df = pd.read_csv(REPO / 'radiomics_database' / 'radiomics_database.csv', dtype={'subject': str})
     ex = df[(df.scan_type == 'ex vivo') & df.roi_series_dir.notna()]
     if not a.all:
         ex = ex[ex.subject.isin(a.subjects)]

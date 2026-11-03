@@ -49,7 +49,7 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 REPO_DIR = Path(__file__).resolve().parent
 DATA_ROOT = REPO_DIR.parent
 BASE = DATA_ROOT.parent                       # roi_series_dir / scan_dir are relative to this
-DB_CSV = DATA_ROOT / 'radiomics_database' / 'radiomics_database.csv'
+DB_CSV = REPO_DIR / 'radiomics_database' / 'radiomics_database.csv'
 OUT = DATA_ROOT / 'figures' / 'opg_comparison'
 
 GROUPS = ['Defect', 'C-OPG', 'Soaked-OPG']

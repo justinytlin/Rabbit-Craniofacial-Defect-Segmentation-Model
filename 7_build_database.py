@@ -60,9 +60,16 @@ PYTHON = sys.executable
 JOBS_FILE = REPO_DIR / 'logs' / 'webapp' / 'jobs.json'
 QC_DIR = DATA_ROOT / 'segmentation_qc_2026-08-11'
 SERIES_SUFFIXES = ('_cylinder', '_ring', '_cylinder_bone', '_ring_bone')
+# Dr. Ren's in vitro scaffold study (web-app `scaffold` mode, 12_scaffold_gold.py):
+# a different experiment, so it gets its OWN tab + CSV, never a `database` row.
+SCAFFOLD_CSV = 'scaffold_database.csv'
 # 'outputs' is the central per-run outputs folder (DATA_ROOT/outputs/...) —
 # it holds ROI series, never raw scans, and must not be walked as one.
 SKIP_DIRS = {'defect_segmentation', '.venv', 'radiomics_database', 'outputs'}
+# The spreadsheet lives INSIDE the repo (since 2026-11-02) so every update is a
+# git commit; DATA_ROOT/radiomics_database is a symlink to it for old paths.
+DB_DIR = REPO_DIR / 'radiomics_database'
+DB_FILES = ('radiomics_database.csv', 'radiomics_database.xlsx', SCAFFOLD_CSV)
 MIN_SLICES = 300
 # Series known to be superseded (README of the 2026-08-11 QC batch).
 SUPERSEDED = {'37951_9m_v2_output_dicom'}
@@ -635,6 +642,13 @@ WHAT IS IN HERE
   feature_dictionary Family, description and units for each feature (113 radiomic features
                      plus the density / particle add-on from 8_density_particles.py).
   (radiomics_database.csv next to this file mirrors the `database` sheet.)
+  scaffold           Dr. Ren's in vitro nanogold scaffold scans (Radiomics/Dr. Ren/) — a
+                     DIFFERENT experiment: gold-labelled hMSCs on 6-8 mm scaffolds, no defect,
+                     no ROI template. ONE row per scan from the web app's scaffold runs
+                     (12_scaffold_gold.py = the study's own analysis/microct_pipeline.py).
+                     Never compare these numbers with the `database` sheet.
+  scaffold_dictionary Column descriptions for the scaffold sheet.
+  (scaffold_database.csv next to this file mirrors the `scaffold` sheet.)
 
 REGIONS
   core  = 10 mm diameter x 8 mm tall cylinder over the defect ("in the defect")
@@ -701,17 +715,31 @@ UPDATE
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--out', default=os.environ.get(
-        'DEFECT_DB_DIR', str(DATA_ROOT / 'radiomics_database')),
-        help='database directory (env DEFECT_DB_DIR overrides the default)')
+    ap.add_argument('--out', default=os.environ.get('DEFECT_DB_DIR', str(DB_DIR)),
+                    help='database directory (env DEFECT_DB_DIR overrides the default)')
+    ap.add_argument('--no-commit', action='store_true',
+                    help='do not git-commit/push the spreadsheet after writing it')
+    ap.add_argument('--commit-database', action='store_true',
+                    help='only commit + push the current spreadsheet files (e.g. after hand edits)')
     ap.add_argument('--no-extract', action='store_true', help='assemble only; do not run 6_extract_features.py')
     ap.add_argument('--add-job', metavar='JOB_ID', action='append',
                     help='incremental: add/refresh one finished web-app run (repeatable)')
+    ap.add_argument('--add-scaffold-job', metavar='JOB_ID', action='append',
+                    help="incremental: add/refresh finished web-app scaffold runs (Dr. Ren's "
+                         'in vitro scans) in the `scaffold` tab (repeatable; written once)')
     args = ap.parse_args()
     out_dir = Path(args.out)
+    global AUTO_COMMIT
+    AUTO_COMMIT = not args.no_commit
+    if args.commit_database:
+        commit_database(out_dir, 'Spreadsheet: hand edits')
+        return
     if args.add_job:
         for jid in args.add_job:
             add_job(jid, out_dir)
+    if args.add_scaffold_job:
+        add_scaffold_jobs(args.add_scaffold_job, out_dir)
+    if args.add_job or args.add_scaffold_job:
         return
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -775,7 +803,7 @@ def backup_outputs(out_dir: Path) -> None:
     """Copy the current CSV/XLSX to backup_<today>/ before they are overwritten.
     Only the first write of a day is kept, so web-app runs do not pile up copies."""
     bdir = out_dir / f'backup_{datetime.now().strftime("%Y-%m-%d")}'
-    for name in ('radiomics_database.csv', 'radiomics_database.xlsx'):
+    for name in ('radiomics_database.csv', 'radiomics_database.xlsx', SCAFFOLD_CSV):
         src, dst = out_dir / name, bdir / name
         if src.exists() and not dst.exists():
             bdir.mkdir(exist_ok=True)
@@ -844,11 +872,27 @@ def write_outputs(df, out_dir):
 
     write_df('database', df, widths={'placement_method': 34, 'qc_flags': 40, 'roi_series': 34, 'scan_dir': 40, 'roi_series_dir': 44, 'qc_batch_note': 40, 'visual_qc_note': 50, 'note': 50, 'other_series_on_disk': 44, 'added_via': 40})
     write_df('feature_dictionary', dict_df, freeze_col=0, widths={'description': 90, 'family': 18, 'columns': 60, 'feature': 36})
+    sc = load_scaffold(out_dir)
+    if sc is not None and not sc.empty:
+        sc = sc[[c for c in SCAFFOLD_COLUMNS if c in sc.columns]
+                + [c for c in sc.columns if c not in SCAFFOLD_COLUMNS]]
+        sc = sc.sort_values(['batch', 'scan']).reset_index(drop=True)
+        write_df('scaffold', sc, freeze_col=6,
+                 widths={'label': 30, 'patient_name': 32, 'scan_dir': 44, 'outputs_dir': 40,
+                         'note': 50, 'added_via': 40, 'qc_flags': 50, 'sanity_flags': 30})
+        write_df('scaffold_dictionary', scaffold_dictionary(), freeze_col=0,
+                 widths={'column': 30, 'description': 100, 'units': 16})
     xlsx = out_dir / 'radiomics_database.xlsx'
     wb.save(xlsx)
 
     print(f'\nWrote {xlsx}')
     print(f'  database : {len(df)} scans, {len(feat_names)} features x (core, ring, core/ring)')
+    if sc is not None and not sc.empty:
+        print(f'  scaffold : {len(sc)} in vitro scaffold scans (Dr. Ren), own tab')
+    if AUTO_COMMIT:
+        n_sc = 0 if sc is None else len(sc)
+        commit_database(out_dir, COMMIT_SUBJECT or
+                        f'Spreadsheet update ({len(df)} database rows, {n_sc} scaffold rows)')
     missing = df[df['feature_status'].astype(str).str.startswith(('failed', 'missing', 'skipped', 'no '))]
     if len(missing):
         print('  scans without features:')
@@ -975,6 +1019,10 @@ def add_job(job_id: str, out_dir: Path) -> dict:
     row['added_via'] = f'web app run {job_id} added {datetime.now().strftime("%Y-%m-%d %H:%M")}'
     if 'core_voxels' not in row:
         raise SystemExit('no features found for this series after extraction')
+    global COMMIT_SUBJECT
+    COMMIT_SUBJECT = (f'Spreadsheet: {scan["subject"]} '
+                      f'{scan["timepoint_months"] or "?"}m {scan["treatment"] or ""} '
+                      f'({ser["series_name"]}, web app run {job_id})').replace('  ', ' ')
 
     # One row per SCAN: replace any existing row for the same scan. The key
     # is the scanner StudyID when the header carries one — so the same scan
@@ -1034,6 +1082,337 @@ def add_job(job_id: str, out_dir: Path) -> dict:
               'timepoint_months': scan['timepoint_months']}
     print('RESULT ' + json.dumps(result))
     return result
+
+
+# ───────────────────────────── Dr. Ren in vitro scaffold tab (web-app scaffold mode)
+
+SCAFFOLD_COLUMNS = [
+    # identity (from Dr. Ren/analysis/manifest.csv via the run's results JSON)
+    'scan', 'batch', 'run', 'scaffold', 'labeled', 'control', 'cells', 'replicate',
+    'diameter_mm', 'culture_date', 'scan_date', 'label',
+    'study_id', 'patient_id', 'patient_name', 'scanner', 'n_slices', 'voxel_mm',
+    'scan_dir', 'outputs_dir',
+    # run bookkeeping
+    'added_via', 'webapp_job_id', 'webapp_status', 'qc_overall', 'qc_flags', 'sanity_flags', 'note',
+    # analysis geometry
+    'k', 'threshold_raw', 'baseline_mode', 'sigma', 'scaffold_volume_mm3',
+    'analysed_thickness_mm', 'top_cut_ratio', 'voi_slices', 'floor_slice', 'stack_slices',
+    # gold metrics at the primary threshold (baseline + k sigma)
+    'gold_vox', 'gold_frac_pct', 'gold_volume_mm3', 'gold_intensity_sum',
+    'D50_mm', 'D50w_mm', 'D90_mm', 'mean_depth_mm', 'frac_surface', 'frac_0p25_1mm',
+    'frac_deeper_1mm', 'deep_density_pct', 'mean_rnorm', 'frac_core', 'n_clusters',
+    'largest_cluster_frac', 'median_cluster_vox', 'frac_gold_bottom15',
+    'floor_zone_gold_vox_T3000',
+    # flags (group_stats.py rules + control ceiling)
+    'flag_bottom_gold', 'flag_floor_gold', 'flag_top_cut', 'flag_thin_voi',
+    'flag_control_above_ceiling', 'flag_labelled_at_control_level',
+    # sensitivity thresholds
+    'k4_gold_frac_pct', 'k6_gold_frac_pct', 'k6_frac_deeper_1mm', 'k6_deep_density_pct',
+    'T3000_gold_frac_pct', 'T3000_frac_deeper_1mm',
+]
+SCAFFOLD_STR_COLS = ['scan', 'batch', 'run', 'scaffold', 'labeled', 'cells', 'replicate',
+                     'culture_date', 'scan_date', 'study_id', 'patient_id', 'patient_name',
+                     'scan_dir', 'outputs_dir', 'webapp_job_id', 'note']
+# Identity / curation columns people may hand-edit in the workbook; the
+# analysis numbers are never carried over (they come from the run).
+SCAFFOLD_EDIT_COLS = ['run', 'batch', 'scaffold', 'labeled', 'control', 'cells', 'replicate',
+                      'diameter_mm', 'culture_date', 'scan_date', 'label', 'note']
+
+SCAFFOLD_DICTIONARY = [
+    ('scan', 'Scan id = folder name under Dr. Ren/<batch>/ (the manifest key). NOT the scanner C-number: folder 6061 holds C0006069_*.DCM.', '-'),
+    ('batch', 'SCANCO batch folder 286-289 (= PatientID).', '-'),
+    ('run', 'Experiment run R1 (pilot, 6 mm) / R2, R3 (500k cells, 8 mm) / R4 (1M cells, 8 mm).', '-'),
+    ('scaffold', 'Scaffold material: CG, MC or PEG-MC.', '-'),
+    ('labeled', 'none (no cells), unlabeled (cells without gold) or PLL-AuNP (gold-labelled cells).', '-'),
+    ('control', 'TRUE for none/unlabeled scans (the threshold calibration set); FALSE for labelled; empty if unknown.', '-'),
+    ('cells', 'Cells seeded per scaffold.', 'count'),
+    ('replicate', 'Replicate number within run x scaffold x labelling.', '-'),
+    ('diameter_mm', 'Scaffold diameter from the lab log.', 'mm'),
+    ('label', 'Human-readable identity: run scaffold labelling cells rep.', '-'),
+    ('qc_overall / qc_flags', 'Worst web-app sanity check (pass / warn / fail) and the non-pass checks.', '-'),
+    ('sanity_flags', 'Flags raised by 12_scaffold_gold.py (same rules as the study report).', '-'),
+    ('k', 'Primary adaptive threshold multiplier: gold = per-slice baseline + k x sigma. k = 5 was calibrated on the 20 controls (95th-percentile control gold <= 0.02 % of scaffold).', '-'),
+    ('threshold_raw', 'The primary threshold in raw SCANCO units (raw / 4096 = linear attenuation, 1/cm).', 'raw'),
+    ('baseline_mode / sigma', 'Global scaffold intensity mode and one-sided robust sigma (per-slice baseline follows the brightness gradient along z).', 'raw'),
+    ('scaffold_volume_mm3', 'Volume of the analysed scaffold envelope (VOI).', 'mm^3'),
+    ('analysed_thickness_mm', 'Median analysed depth per column (stack top to the floor cut). Usually 2.3-4.4 mm; < 2 mm is flagged.', 'mm'),
+    ('top_cut_ratio', 'Envelope area in the first slice / mid-stack area. > 0.3 means the dome is cut at the top of the stack (flag_top_cut).', '-'),
+    ('voi_slices / floor_slice / stack_slices', 'Number of VOI slices, index where the bright floor plane starts, total slices.', 'count'),
+    ('gold_vox / gold_frac_pct / gold_volume_mm3', 'Gold-like voxels inside the VOI at the primary threshold, as a count, as % of the VOI, and as volume.', 'count / % / mm^3'),
+    ('gold_intensity_sum', 'Sum of (intensity - baseline) over gold voxels (intensity-weighted gold amount).', 'raw'),
+    ('D50_mm / D90_mm / mean_depth_mm', 'Median / 90th-percentile / mean depth of gold voxels below the seeded top surface of their own column.', 'mm'),
+    ('D50w_mm', 'Intensity-weighted median depth.', 'mm'),
+    ('frac_surface / frac_0p25_1mm / frac_deeper_1mm', 'Fraction of gold voxels within 0.25 mm of the surface / between 0.25 and 1 mm / deeper than 1 mm.', 'fraction'),
+    ('deep_density_pct', 'Gold voxels deeper than 1 mm as % of scaffold voxels deeper than 1 mm (the migration test; at control level in the study).', '%'),
+    ('mean_rnorm / frac_core', 'Mean normalised radial position of gold (0 centre, 1 edge) and fraction with r < 0.5. CG was peripheral (0.82), PEG-MC central (0.53).', '-'),
+    ('n_clusters / largest_cluster_frac / median_cluster_vox', '26-connected gold clusters: count, share of gold in the largest, median cluster size.', 'count / fraction / voxels'),
+    ('frac_gold_bottom15', 'Share of gold in the deepest 15 % of the VOI (> 0.3 with > 500 gold voxels = flag_bottom_gold: possibly scanned face-down).', 'fraction'),
+    ('floor_zone_gold_vox_T3000', 'Voxels > 3000 raw in the excluded floor zone (> 5000 = flag_floor_gold).', 'count'),
+    ('k4_* / k6_* / T3000_*', 'Sensitivity analyses at k = 4, k = 6 and a fixed 3000 raw threshold (all thresholds are in <scan>_scaffold_metrics.csv in outputs_dir).', 'as named'),
+]
+
+
+def scaffold_dictionary():
+    return pd.DataFrame([{'column': c, 'description': d, 'units': u} for c, d, u in SCAFFOLD_DICTIONARY])
+
+
+def load_scaffold(out_dir: Path):
+    f = out_dir / SCAFFOLD_CSV
+    if not f.exists():
+        return None
+    df = pd.read_csv(f, dtype={c: str for c in SCAFFOLD_STR_COLS}, keep_default_na=True)
+    for c in [c for c in df.columns if c.startswith('flag_')]:
+        df[c] = df[c].astype(str).str.lower().eq('true')
+    if 'control' in df.columns:
+        df['control'] = df['control'].map(lambda v: True if str(v).lower() == 'true'
+                                          else False if str(v).lower() == 'false' else None)
+    return df
+
+
+def carry_over_scaffold_edits(df, out_dir: Path):
+    """Keep hand edits made to identity / note columns of the `scaffold` tab
+    (matched by scan id — row order may differ). Analysis numbers always
+    come from the run."""
+    xlsx = out_dir / 'radiomics_database.xlsx'
+    if df is None or df.empty or not xlsx.exists():
+        return df
+    try:
+        x = pd.read_excel(xlsx, sheet_name='scaffold', dtype={c: str for c in SCAFFOLD_STR_COLS})
+    except ValueError:                      # no scaffold sheet yet
+        return df
+    except Exception as e:                  # noqa: BLE001
+        print(f'  note: could not read the scaffold tab ({e}); using the CSV')
+        return df
+    x = x.set_index('scan')
+    norm = lambda v: '' if v is None or (isinstance(v, float) and np.isnan(v)) else str(v).strip().replace('.0', '') if isinstance(v, (int, float)) else str(v).strip()
+    kept = 0
+    for col in SCAFFOLD_EDIT_COLS:
+        if col not in df.columns or col not in x.columns:
+            continue
+        for i, scan in df['scan'].items():
+            if scan not in x.index:
+                continue
+            a, b = df.at[i, col], x.at[scan, col]
+            if norm(a) != norm(b):
+                df[col] = df[col].astype(object)
+                df.at[i, col] = None if norm(b) == '' else b
+                kept += 1
+    if kept:
+        print(f'  keeping {kept} hand edit(s) from the scaffold tab')
+    return df
+
+
+def scaffold_row(job: dict, res: dict) -> dict:
+    """One `scaffold` row from a finished web-app scaffold run + its results JSON."""
+    input_dir = Path(job['params']['input'])
+    out_base = Path(job['params']['output'])
+    hdr = {}
+    try:
+        hdr = read_header(input_dir)
+    except Exception as e:                  # noqa: BLE001
+        print(f'  note: could not read the DICOM header of {input_dir}: {e}')
+    man = res.get('manifest') or {}
+    um = res.get('user_meta') or job.get('user_meta') or {}
+    g, p, meta, flags = (res.get('geometry') or {}, res.get('primary') or {},
+                         res.get('meta') or {}, res.get('flags') or {})
+    thr = {(t.get('kind'), t.get('k'), round(float(t.get('T') or 0))): t
+           for t in res.get('thresholds') or []}
+
+    def at(kind, k=None, T=None, key='gold_frac_pct'):
+        for (kd, kk, tt), t in thr.items():
+            if kd == kind and (k is None or kk == k) and (T is None or tt == T):
+                return t.get(key)
+        return None
+
+    checks = job.get('checks') or []
+    rank = {'pass': 0, 'warn': 1, 'fail': 2}
+    worst = max((rank.get(c.get('status'), 0) for c in checks), default=None)
+    try:
+        rel = str(input_dir.relative_to(DATA_ROOT.parent.parent))
+    except ValueError:
+        rel = str(input_dir)
+    row = {
+        'scan': str(res.get('scan') or job.get('context', {}).get('subject') or input_dir.name),
+        'batch': man.get('batch') or (hdr.get('patient_id') or None),
+        'run': man.get('run'), 'scaffold': man.get('scaffold'),
+        'labeled': man.get('labeled') or (um.get('treatment') or None),
+        'control': res.get('control'),
+        'cells': man.get('cells'), 'replicate': man.get('replicate'),
+        'diameter_mm': man.get('diameter_mm'),
+        'culture_date': man.get('culture_date'), 'scan_date': man.get('scan_date'),
+        'label': res.get('label'),
+        'study_id': hdr.get('study_id'), 'patient_id': hdr.get('patient_id'),
+        'patient_name': hdr.get('patient_name'), 'scanner': hdr.get('manufacturer'),
+        'n_slices': meta.get('n_slices') or hdr.get('n_slices'),
+        'voxel_mm': (meta.get('voxel_mm') or [None])[0],
+        'scan_dir': rel, 'outputs_dir': str(out_base.parent),
+        'added_via': f'web app scaffold run {job["id"]} added {datetime.now().strftime("%Y-%m-%d %H:%M")}',
+        'webapp_job_id': job['id'], 'webapp_status': job.get('status'),
+        'qc_overall': {0: 'pass', 1: 'warn', 2: 'fail', None: None}[worst],
+        'qc_flags': '; '.join(f'{c["name"]}: {c["status"]}' for c in checks if c.get('status') != 'pass') or '',
+        'sanity_flags': '; '.join(k for k, v in flags.items() if v) or '',
+        'note': '; '.join(x for x in ((man.get('note') or '').strip(),
+                                      (um.get('notes') or '').strip()) if x) or '',
+        'k': meta.get('k'), 'threshold_raw': p.get('T'),
+        'baseline_mode': g.get('mode'), 'sigma': g.get('sigma'),
+        'scaffold_volume_mm3': g.get('scaffold_volume_mm3'),
+        'analysed_thickness_mm': g.get('analysed_thickness_mm'),
+        'top_cut_ratio': g.get('top_cut_ratio'), 'voi_slices': g.get('z_end'),
+        'floor_slice': g.get('floor_start'), 'stack_slices': g.get('nz'),
+        'floor_zone_gold_vox_T3000': g.get('floor_zone_gold_vox_T3000'),
+        'flag_bottom_gold': bool(flags.get('bottom_gold')),
+        'flag_floor_gold': bool(flags.get('floor_gold')),
+        'flag_top_cut': bool(flags.get('top_cut')),
+        'flag_thin_voi': bool(flags.get('thin_voi')),
+        'flag_control_above_ceiling': bool(flags.get('control_above_ceiling')),
+        'flag_labelled_at_control_level': bool(flags.get('labelled_at_control_level')),
+        'k4_gold_frac_pct': at('adaptive', k=4.0),
+        'k6_gold_frac_pct': at('adaptive', k=6.0),
+        'k6_frac_deeper_1mm': at('adaptive', k=6.0, key='frac_deeper_1mm'),
+        'k6_deep_density_pct': at('adaptive', k=6.0, key='deep_density_pct'),
+        'T3000_gold_frac_pct': at('fixed', T=3000),
+        'T3000_frac_deeper_1mm': at('fixed', T=3000, key='frac_deeper_1mm'),
+    }
+    for key in ('gold_vox', 'gold_frac_pct', 'gold_volume_mm3', 'gold_intensity_sum',
+                'D50_mm', 'D50w_mm', 'D90_mm', 'mean_depth_mm', 'frac_surface',
+                'frac_0p25_1mm', 'frac_deeper_1mm', 'deep_density_pct', 'mean_rnorm',
+                'frac_core', 'n_clusters', 'largest_cluster_frac', 'median_cluster_vox',
+                'frac_gold_bottom15'):
+        row[key] = p.get(key)
+    return row
+
+
+def add_scaffold_jobs(job_ids, out_dir: Path) -> dict:
+    """Upsert finished web-app scaffold runs into the `scaffold` tab (one row
+    per scan, keyed by scan id / StudyID) and rewrite the workbook ONCE. The
+    `database` sheet is re-emitted from its CSV (+ workbook hand edits) so
+    nothing else in the file changes."""
+    try:
+        jobs_raw = json.loads(JOBS_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f'cannot read run history: {e}')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sc = load_scaffold(out_dir)
+    if sc is not None and not sc.empty:
+        sc = carry_over_scaffold_edits(sc, out_dir)
+    added, replaced, skipped = [], 0, []
+    for jid in job_ids:
+        job = jobs_raw.get(jid)
+        if not job:
+            raise SystemExit(f'no such run: {jid}')
+        if job.get('mode') != 'scaffold':
+            raise SystemExit(f'run {jid} is a {job.get("mode")} run, not a scaffold run — use --add-job')
+        if job.get('status') not in ('done', 'done_warn'):
+            skipped.append(f'{jid} ({job.get("status")})')
+            continue
+        jf = Path(job['params']['output'] + '.json')
+        if not jf.is_file():
+            raise SystemExit(f'results file missing: {jf}')
+        res = json.loads(jf.read_text())
+        row = scaffold_row(job, res)
+        if sc is not None and not sc.empty:
+            same = sc['scan'].astype(str) == row['scan']
+            sid = str(row.get('study_id') or '').strip()
+            if sid and 'study_id' in sc.columns:
+                same |= sc['study_id'].fillna('').astype(str).str.strip() == sid
+            if same.any():
+                prev = sc[same].iloc[0]
+                replaced += 1
+                # keep a hand-written note; the manifest note is re-derived
+                pn = str(prev.get('note') or '')
+                if pn and pn not in row['note']:
+                    row['note'] = pn + (' — ' + row['note'] if row['note'] else '')
+                sc = sc[~same]
+            sc = pd.concat([sc, pd.DataFrame([row])], ignore_index=True, sort=False)
+        else:
+            sc = pd.DataFrame([row])
+        added.append(row['scan'])
+    if not added:
+        raise SystemExit('nothing added: ' + ', '.join(skipped))
+    sc = sc[[c for c in SCAFFOLD_COLUMNS if c in sc.columns]
+            + [c for c in sc.columns if c not in SCAFFOLD_COLUMNS]]
+    sc = sc.sort_values(['batch', 'scan']).reset_index(drop=True)
+    backup_outputs(out_dir)
+    sc.to_csv(out_dir / SCAFFOLD_CSV, index=False)
+    global COMMIT_SUBJECT
+    COMMIT_SUBJECT = ('Spreadsheet: scaffold tab — ' + ', '.join(added[:6])
+                      + (f' … ({len(added)} scans)' if len(added) > 6 else '')
+                      + (' replaced' if replaced and len(added) == 1 else ''))
+
+    df = load_existing(out_dir)
+    if df is not None and not df.empty:
+        try:
+            df = carry_over_xlsx_edits(df, out_dir, STR_COLS)
+        except SystemExit as e:
+            print(f'  note: workbook edits not carried over ({e})')
+        except Exception as e:              # noqa: BLE001
+            print(f'  note: could not read the workbook ({e}); using the CSV')
+        write_outputs(df, out_dir)
+    else:
+        raise SystemExit('radiomics_database.csv is missing — the scaffold CSV was written, '
+                         'but the workbook was not rebuilt without the main database')
+    last = sc[sc['scan'] == added[-1]].iloc[0]
+    result = {'ok': True, 'jobs': list(job_ids), 'sheet': 'scaffold',
+              'added': added, 'replaced': int(replaced), 'skipped': skipped,
+              'n_scaffold': int(len(sc)), 'xlsx': str(out_dir / 'radiomics_database.xlsx'),
+              'scan': str(last['scan']), 'run': last.get('run'), 'scaffold': last.get('scaffold'),
+              'labeled': last.get('labeled')}
+    print('RESULT ' + json.dumps(result, default=str))
+    return result
+
+
+# ───────────────────────────────────────────── git: the spreadsheet is versioned
+
+AUTO_COMMIT = True
+COMMIT_SUBJECT = None
+
+
+def commit_database(out_dir: Path, subject: str) -> bool:
+    """Commit the spreadsheet files (CSV, XLSX, scaffold CSV) and push. Only
+    acts when out_dir is inside THIS repository (so test dirs via
+    DEFECT_DB_DIR are never committed). Never raises: a missing network or
+    a refused push leaves the commit local and prints a note — the run that
+    produced the spreadsheet is not affected."""
+    import subprocess
+    out_dir = Path(out_dir).resolve()
+    try:
+        top = subprocess.run(['git', '-C', str(out_dir), 'rev-parse', '--show-toplevel'],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if top.returncode != 0 or Path(top.stdout.strip()).resolve() != REPO_DIR.resolve():
+        print(f'  (spreadsheet not committed: {out_dir} is not inside the repository)')
+        return False
+    files = [str(out_dir / f) for f in DB_FILES if (out_dir / f).exists()]
+    if not files:
+        return False
+
+    def git(*a, timeout=120):
+        return subprocess.run(['git', '-C', str(REPO_DIR), *a],
+                              capture_output=True, text=True, timeout=timeout)
+    try:
+        git('add', '--', *files)
+        if git('diff', '--cached', '--quiet', '--', *files).returncode == 0:
+            print('  spreadsheet unchanged — nothing to commit')
+            return False
+        body = (f'{subject}\n\nAutomatic commit by defect_segmentation/7_build_database.py '
+                f'on {datetime.now().strftime("%Y-%m-%d %H:%M")}.')
+        c = git('commit', '--only', '-m', body, '--', *files)
+        if c.returncode != 0:
+            print(f'  spreadsheet commit FAILED: {(c.stderr or c.stdout).strip()[-300:]}')
+            return False
+        sha = git('rev-parse', '--short', 'HEAD').stdout.strip()
+        print(f'  spreadsheet committed as {sha}: {subject}')
+        p = git('push', timeout=180)
+        if p.returncode == 0:
+            print('  pushed to GitHub')
+        else:
+            print('  push FAILED (commit kept locally; push later with `git push`): '
+                  + (p.stderr or p.stdout).strip().splitlines()[-1][:200])
+        return True
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f'  spreadsheet commit/push skipped: {e}')
+        return False
 
 
 if __name__ == '__main__':

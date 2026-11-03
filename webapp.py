@@ -57,14 +57,27 @@ EXVIVO_ROOT = DATA_ROOT.parent / 'Ex Vivo CT Data'
 # A voxel this small can only be a specimen µCT — in vivo scans are 0.1 mm.
 EXVIVO_MAX_SPACING_MM = 0.03
 
-ALLOWED_ROOTS = [DATA_ROOT] + ([EXVIVO_ROOT] if EXVIVO_ROOT.is_dir() else [])
+# In vitro scaffold archive (Dr. Ren's nanogold hMSC-migration study): SCANCO
+# µCT of 6–8 mm scaffolds at 37 µm with NO calvarial defect. The rabbit
+# pipeline cannot place its 18 mm template on them (2026-10-27: "specimen
+# never covers the reference ring"); they get 12_scaffold_gold.py instead,
+# which re-uses the study's own analysis/microct_pipeline.py per scan.
+SCAFFOLD_ROOT = DATA_ROOT.parent.parent / 'Dr. Ren'
+SCAFFOLD_MANIFEST = SCAFFOLD_ROOT / 'analysis' / 'manifest.csv'
+SCAFFOLD_OUTPUTS_DIR = SCAFFOLD_ROOT / 'outputs'
+SCAFFOLD_MIN_DCM = 30            # these stacks are 80–135 slices (study scans 1200)
+SCAFFOLD_OUTPUT_SUFFIXES = ('.json', '_metrics.csv', '_depth_profile.csv', '_qc.png')
+
+ALLOWED_ROOTS = [DATA_ROOT] + ([EXVIVO_ROOT] if EXVIVO_ROOT.is_dir() else []) \
+    + ([SCAFFOLD_ROOT] if SCAFFOLD_ROOT.is_dir() else [])
 SCAN_ROOTS = list(ALLOWED_ROOTS)
 
 UPLOADS_DIR = APP_DIR / 'uploads'
 INDEX_FILE = APP_DIR / 'scan_index.json'
 # Study-wide spreadsheet (7_build_database.py). Overridable for testing.
+# Lives inside the repo (git-versioned; every run's update is a commit).
 DATABASE_DIR = Path(os.environ.get('DEFECT_DB_DIR')
-                    or (DATA_ROOT / 'radiomics_database'))
+                    or (REPO_DIR / 'radiomics_database'))
 DATABASE_LOCK = threading.Lock()
 
 # All new runs write their series into one central folder, one subfolder per
@@ -172,6 +185,22 @@ def clear_outputs_folder(folder: Path):
             p.unlink()
 
 
+def clear_scaffold_folder(folder: Path):
+    """A re-run of a scaffold scan replaces its result files (JSON, CSVs,
+    QC overlay) in Dr. Ren/outputs/<scan>_scaffold/. Nothing else is touched
+    and nothing outside that outputs folder is ever cleared."""
+    folder = folder.resolve()
+    if SCAFFOLD_OUTPUTS_DIR.resolve() not in folder.parents:
+        raise RuntimeError(f'refusing to clear {folder} — not under {SCAFFOLD_OUTPUTS_DIR}')
+    if not folder.is_dir():
+        return
+    for e in os.scandir(folder):
+        if e.name.startswith('.') or not e.is_file():
+            continue
+        if e.name.endswith(tuple('_scaffold' + x for x in SCAFFOLD_OUTPUT_SUFFIXES)):
+            Path(e.path).unlink()
+
+
 # ─────────────────────────────────────────────────────────────── scan index
 
 def read_study_id(dcm_path: Path):
@@ -218,6 +247,65 @@ def scan_is_exvivo(input_dir: Path) -> bool:
         return False
 
 
+def scan_is_scaffold(input_dir: Path) -> bool:
+    """In vitro scaffold scans (Dr. Ren's nanogold study): recognised by
+    location in the scaffold archive, or by the scanner's PatientName
+    ('7.9.25 Nanogold D7 GM R1 (6mm)'). Checked BEFORE scan_is_exvivo — these
+    are SCANCO scans too, but hold no defect."""
+    try:
+        if SCAFFOLD_ROOT.is_dir() and SCAFFOLD_ROOT in input_dir.resolve().parents:
+            return True
+    except OSError:
+        pass
+    f = first_dcm(input_dir)
+    if not f:
+        return False
+    try:
+        import pydicom
+        ds = pydicom.dcmread(str(f), stop_before_pixels=True)
+        name = str(getattr(ds, 'PatientName', '') or '').lower()
+        return 'nanogold' in name or 'scaffold' in name
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def scaffold_manifest_row(scan_id):
+    """Row of Dr. Ren/analysis/manifest.csv for a scan id (folder name)."""
+    if not scan_id or not SCAFFOLD_MANIFEST.is_file():
+        return None
+    try:
+        import csv
+        with open(SCAFFOLD_MANIFEST, newline='') as fh:
+            for row in csv.DictReader(fh):
+                if (row.get('scan') or '').strip() == str(scan_id).strip():
+                    return row
+    except OSError:
+        pass
+    return None
+
+
+def scaffold_context(input_dir: Path, sample=None) -> dict:
+    """detect_context() equivalent for a scaffold scan: identity from the
+    study manifest (run / scaffold / labelling / cells), no timepoint or
+    reference, output under Dr. Ren/outputs/<scan>_scaffold/."""
+    scan_id = str(sample or input_dir.name).strip()
+    row = scaffold_manifest_row(scan_id)
+    info = {'subject': scan_id, 'group': None, 'timepoint': None, 'is_3m': None,
+            'tp_short': None, 'ref_input': None, 'ref_roi': None,
+            'scaffold': True, 'manifest': row, 'n_dcm': count_dcm(input_dir)}
+    if row:
+        info['group'] = f"{row.get('scaffold') or '?'} · {row.get('labeled') or '?'}"
+        try:
+            cells = f"{int(float(row.get('cells') or 0)) // 1000}k cells"
+        except ValueError:
+            cells = f"{row.get('cells')} cells"
+        info['timepoint'] = (f"run {row.get('run')} (batch {row.get('batch')}), {cells}, "
+                             f"rep {row.get('replicate')}, Ø {row.get('diameter_mm')} mm")
+    base = sanitize_component(scan_id)
+    info['suggested_output'] = str(SCAFFOLD_OUTPUTS_DIR / f'{base}_scaffold' / f'{base}_scaffold')
+    return info
+
+
 def first_dcm(d: Path):
     try:
         with os.scandir(d) as it:
@@ -239,17 +327,21 @@ def build_scan_index():
             INDEX_STATE['status'] = 'ready'
         fresh = {}
         for root in SCAN_ROOTS:
+            # Scaffold stacks are short (80–135 slices); study scans are 1200.
+            min_dcm = SCAFFOLD_MIN_DCM if root == SCAFFOLD_ROOT else 500
             for dirpath, dirnames, filenames in os.walk(root):
                 rel_depth = len(Path(dirpath).parts) - len(root.parts)
                 dirnames[:] = [d for d in dirnames if not d.startswith('.')
                                and d != 'defect_segmentation'
                                and d != 'outputs'      # central outputs folder
+                               and d not in ('analysis', 'results')   # Dr. Ren
                                and 'output_dicom' not in d]
                 if rel_depth >= 5:
                     dirnames[:] = []
                 d = Path(dirpath)
-                n = sum(1 for f in filenames if f.lower().endswith('.dcm'))
-                if n < 500 or 'output_dicom' in d.name:
+                n = sum(1 for f in filenames if f.lower().endswith('.dcm')
+                        and not f.startswith('.'))
+                if n < min_dcm or 'output_dicom' in d.name:
                     continue
                 f = first_dcm(d)
                 sid = read_study_id(f) if f else None
@@ -274,6 +366,8 @@ def detect_context(input_dir: Path) -> dict:
     """Infer subject / group / timepoint / reference from the folder layout:
     <GROUP>/<N MONTH>/<SUBJECT>/dicom_t*  with GT at <GROUP>/3 MONTH/<SUBJ>/<SUBJ>_output_dicom
     """
+    if scan_is_scaffold(input_dir):
+        return scaffold_context(input_dir)
     parts = list(input_dir.parts)
     info = {'subject': None, 'group': None, 'timepoint': None, 'is_3m': None,
             'tp_short': None, 'ref_input': None, 'ref_roi': None,
@@ -502,7 +596,19 @@ def worker():
         # Every successful run goes into the study spreadsheet automatically.
         # Runs whose checks include a FAIL (done_fail) and errored runs are
         # never added; a failure to add never changes the run's own status.
-        if job.get('status') in ('done', 'done_warn'):
+        if job.get('mode') == 'scaffold' and job.get('status') in ('done', 'done_warn'):
+            # Dr. Ren's scans go to their OWN tab of the spreadsheet.
+            try:
+                add_scaffold_job_to_database(job)
+                job.pop('database_error', None)
+            except Exception as e:                      # noqa: BLE001
+                job['database_error'] = str(e)
+                with open(job_log_path(jid), 'a') as fh:
+                    fh.write(f'\nCould not add to the scaffold tab: {e}\n')
+        elif job.get('mode') == 'scaffold':
+            with open(job_log_path(jid), 'a') as fh:
+                fh.write('\nNot added to the scaffold tab: the run did not pass.\n')
+        elif job.get('status') in ('done', 'done_warn'):
             try:
                 add_job_to_database(job)
                 job.pop('database_error', None)
@@ -545,9 +651,15 @@ def _run_job(job):
     with open(job_log_path(job['id']), 'a') as fh:
         try:
             in_outputs = OUTPUTS_DIR.resolve() in out.resolve().parents
+            in_scaffold = SCAFFOLD_OUTPUTS_DIR.resolve() in out.resolve().parents
         except OSError:
-            in_outputs = False
-        if in_outputs:
+            in_outputs = in_scaffold = False
+        if job['mode'] == 'scaffold':
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if in_scaffold:
+                clear_scaffold_folder(out.parent)
+                fh.write(f'Outputs folder: {out.parent} (previous results replaced)\n')
+        elif in_outputs:
             # Central outputs folder: a re-run REPLACES the folder contents.
             out.parent.mkdir(parents=True, exist_ok=True)
             clear_outputs_folder(out.parent)
@@ -556,7 +668,25 @@ def _run_job(job):
             clear_previous_output(out)
             fh.write(f'Cleared previous series for {out.name}\n')
 
-        if adjust_pose:
+        if job['mode'] == 'scaffold':
+            # In vitro scaffold: gold-label quantification with the study's
+            # own pipeline — no ROI series, no BV/TV, no feature extraction.
+            scan_id = (job.get('context') or {}).get('subject') or Path(p['input']).name
+            cmd = [PYTHON, '12_scaffold_gold.py', '--input', p['input'],
+                   '--output', out, '--scan-id', scan_id]
+            if SCAFFOLD_MANIFEST.is_file():
+                cmd += ['--manifest', SCAFFOLD_MANIFEST]
+            if job.get('user_meta'):
+                cmd += ['--meta', json.dumps(job['user_meta'])]
+            rc = run_step(job, cmd, fh)
+            if rc != 0:
+                raise RuntimeError(f'scaffold gold quantification exited with code {rc}')
+            try:
+                job['results'] = {'scaffold': json.loads(
+                    (out.parent / (out.name + '.json')).read_text())}
+            except (OSError, json.JSONDecodeError) as e:
+                fh.write(f'could not read the results JSON: {e}\n')
+        elif adjust_pose:
             # Manual readjustment of THIS run: re-stamp the template at the
             # nudged pose into the same series, replacing the files in place.
             rc = run_step(job, [PYTHON, 'stamp_roi.py', '--input', p['input'],
@@ -627,31 +757,32 @@ def _run_job(job):
             if rc != 0:
                 raise RuntimeError(f'inference exited with code {rc}')
 
-        fh.write('\nComputing ROI volumes and BV/TV from the written series...\n')
-        fh.flush()
-        try:
-            job['results'] = compute_results(out, float(thr))
-            fh.write('done.\n')
-        except Exception as e:                          # noqa: BLE001
-            fh.write(f'volume computation failed: {e}\n')
-
-        # Otsu + radiomic features. A failure here never fails the run —
-        # the ROI series and BV/TV above are already complete.
-        rc = run_step(job, [PYTHON, '6_extract_features.py',
-                            '--input', p['input'], '--roi', out,
-                            '--bone-threshold', thr], fh)
-        if rc == 0:
-            fjson = out.parent / (out.name + '_features.json')
+        if job['mode'] != 'scaffold':
+            fh.write('\nComputing ROI volumes and BV/TV from the written series...\n')
+            fh.flush()
             try:
-                job.setdefault('results', {})['features'] = \
-                    json.loads(fjson.read_text())
-                job['results']['features_csv'] = str(
-                    out.parent / (out.name + '_features.csv'))
-            except (OSError, json.JSONDecodeError) as e:
-                fh.write(f'could not read features JSON: {e}\n')
-        else:
-            fh.write('feature extraction failed — see above; the ROI series '
-                     'and BV/TV are unaffected.\n')
+                job['results'] = compute_results(out, float(thr))
+                fh.write('done.\n')
+            except Exception as e:                          # noqa: BLE001
+                fh.write(f'volume computation failed: {e}\n')
+
+            # Otsu + radiomic features. A failure here never fails the run —
+            # the ROI series and BV/TV above are already complete.
+            rc = run_step(job, [PYTHON, '6_extract_features.py',
+                                '--input', p['input'], '--roi', out,
+                                '--bone-threshold', thr], fh)
+            if rc == 0:
+                fjson = out.parent / (out.name + '_features.json')
+                try:
+                    job.setdefault('results', {})['features'] = \
+                        json.loads(fjson.read_text())
+                    job['results']['features_csv'] = str(
+                        out.parent / (out.name + '_features.csv'))
+                except (OSError, json.JSONDecodeError) as e:
+                    fh.write(f'could not read features JSON: {e}\n')
+            else:
+                fh.write('feature extraction failed — see above; the ROI series '
+                         'and BV/TV are unaffected.\n')
 
     log_text = job_log_path(job['id']).read_text(errors='replace')
     job['metrics'] = parse_metrics(log_text)
@@ -659,7 +790,8 @@ def _run_job(job):
     worst = min((c['status'] for c in job['checks']), default='pass',
                 key=lambda s: {'fail': 0, 'warn': 1, 'pass': 2}[s])
     job['status'] = 'done' if worst == 'pass' else ('done_warn' if worst == 'warn' else 'done_fail')
-    preview = out.parent / (out.name + '_axial_view.png')
+    preview = out.parent / (out.name + ('_qc.png' if job['mode'] == 'scaffold'
+                                        else '_axial_view.png'))
     if preview.exists():
         job['preview'] = str(preview)
     if adjust_pose:
@@ -792,6 +924,91 @@ def compute_results(output_base: Path, bone_threshold: float) -> dict:
 
 
 def build_checks(job) -> list:
+    if job['mode'] == 'scaffold':
+        return build_scaffold_checks(job)
+    return _build_defect_checks(job)
+
+
+def build_scaffold_checks(job) -> list:
+    """Sanity checks for an in vitro scaffold run — the flag rules of
+    Dr. Ren/analysis/group_stats.py, plus the control-ceiling test."""
+    checks = []
+
+    def add(name, status, detail):
+        checks.append({'name': name, 'status': status, 'detail': detail})
+
+    add('Analysis method', 'pass',
+        'In vitro scaffold gold quantification (Dr. Ren nanogold study): '
+        'scaffold envelope → floor-plane cut → per-slice baseline → gold = '
+        'baseline + 5σ, the threshold calibrated on the 20 unlabeled / no-cell '
+        'controls. No defect template or network is involved, and nothing '
+        'here is comparable to a rabbit-defect BV/TV.')
+    s = (job.get('results') or {}).get('scaffold')
+    if not s:
+        add('Results', 'fail', 'No results file was written — see the console log.')
+        return checks
+    g, p = s.get('geometry') or {}, s.get('primary') or {}
+    thick = g.get('analysed_thickness_mm')
+    if thick is not None:
+        if thick < 2.0:
+            add('Analysed depth', 'warn',
+                f'Only {thick:.2f} mm of scaffold analysed (short stack) — the '
+                'depth fractions cover less than the usual 2.3–4.4 mm.')
+        else:
+            add('Analysed depth', 'pass', f'{thick:.2f} mm of scaffold below the top surface.')
+    tc = g.get('top_cut_ratio')
+    if tc is not None:
+        if tc > 0.3:
+            add('Top surface', 'warn',
+                f'Envelope area in the first slice is {tc:.2f}× the mid-stack '
+                'area — the dome is cut at the top of the stack, so part of the '
+                'seeded surface may be missing.')
+        else:
+            add('Top surface', 'pass', 'The seeded top surface lies fully inside the stack.')
+    floor = g.get('floor_zone_gold_vox_T3000')
+    if floor is not None:
+        if floor > 5000:
+            add('Floor zone', 'warn',
+                f'{floor:,} gold-like voxels in the excluded floor zone — bright '
+                'floor material or a cell sheet on the floor. VOI metrics exclude it; '
+                'check the QC overlay.')
+        else:
+            add('Floor zone', 'pass', f'{floor:,} gold-like voxels below the floor cut.')
+    fb, gv = p.get('frac_gold_bottom15'), p.get('gold_vox') or 0
+    if fb is not None and gv > 500 and fb > 0.3:
+        add('Gold at the bottom', 'warn',
+            f'{100 * fb:.0f}% of the gold sits in the deepest 15% of the VOI — '
+            'possibly scanned seeded-face-down; inspect the QC overlay before '
+            'reading this as penetration.')
+    gf, control = p.get('gold_frac_pct'), s.get('control')
+    if gf is not None:
+        ceiling = 0.02
+        if control is True:
+            if gf > ceiling:
+                add('Control level', 'warn',
+                    f'Unlabelled / no-cell scaffold with {gf:.3f}% gold-like voxels — '
+                    f'above the {ceiling}% control ceiling (intrinsic bright particles '
+                    'or contamination).')
+            else:
+                add('Control level', 'pass',
+                    f'{gf:.3f}% gold-like voxels — at control level (≤ {ceiling}%).')
+        elif control is False:
+            if gf <= ceiling:
+                add('Label detected', 'warn',
+                    f'Labelled scaffold with only {gf:.3f}% gold — at control level; '
+                    'the label was not detected.')
+            else:
+                add('Label detected', 'pass',
+                    f'{gf:.3f}% of scaffold volume — {gf / ceiling:.0f}× the '
+                    f'{ceiling}% control ceiling.')
+        else:
+            add('Label detected', 'pass' if gf > ceiling else 'warn',
+                f'{gf:.3f}% of scaffold volume (control ceiling {ceiling}%); the '
+                'scan is not in the study manifest, so its labelling is unknown.')
+    return checks
+
+
+def _build_defect_checks(job) -> list:
     m = job.get('metrics', {})
     checks = []
     def add(name, status, detail):
@@ -1029,6 +1246,78 @@ def database_status() -> dict:
     return info
 
 
+_SCAFFOLD_DB_CACHE = {'mtime': None, 'rows': {}}
+
+
+def scaffold_db_entry(job) -> dict:
+    """Spreadsheet status of a scaffold run that was added OUTSIDE this
+    server process (the CLI backfill of 2026-10-28, or an add that happened
+    before a restart): look the run up in scaffold_database.csv by its
+    webapp_job_id. Cached by file mtime."""
+    f = DATABASE_DIR / 'scaffold_database.csv'
+    try:
+        mtime = f.stat().st_mtime
+    except OSError:
+        return None
+    if _SCAFFOLD_DB_CACHE['mtime'] != mtime:
+        import csv
+        rows = {}
+        try:
+            with open(f, newline='') as fh:
+                for r in csv.DictReader(fh):
+                    rows[r.get('webapp_job_id', '')] = r
+                rows['__n__'] = len(rows)
+        except OSError:
+            return None
+        _SCAFFOLD_DB_CACHE.update(mtime=mtime, rows=rows)
+    r = _SCAFFOLD_DB_CACHE['rows'].get(job['id'])
+    if not r:
+        return None
+    m = re.search(r'added (\d{4}-\d{2}-\d{2} \d{2}:\d{2})', r.get('added_via') or '')
+    try:
+        added = time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M')) if m else mtime
+    except ValueError:
+        added = mtime
+    return {'added': added, 'sheet': 'scaffold', 'scan': r.get('scan'),
+            'replaced': False, 'run': r.get('run'), 'scaffold': r.get('scaffold'),
+            'labeled': r.get('labeled'),
+            'n_scaffold': _SCAFFOLD_DB_CACHE['rows'].get('__n__'),
+            'xlsx': str(DATABASE_DIR / 'radiomics_database.xlsx')}
+
+
+def add_scaffold_job_to_database(job) -> dict:
+    """Upsert one finished scaffold run into the `scaffold` tab via
+    7_build_database.py --add-scaffold-job."""
+    with DATABASE_LOCK:
+        proc = subprocess.run(
+            [PYTHON, str(REPO_DIR / '7_build_database.py'), '--add-scaffold-job', job['id'],
+             '--out', str(DATABASE_DIR)],
+            cwd=str(REPO_DIR), capture_output=True, text=True, timeout=600)
+    with open(job_log_path(job['id']), 'a') as fh:
+        fh.write(f'\nAdding to the scaffold tab of the spreadsheet ({DATABASE_DIR.name})...\n')
+        fh.write(proc.stdout)
+        if proc.stderr:
+            fh.write(proc.stderr)
+    result = None
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith('RESULT '):
+            try:
+                result = json.loads(line[7:])
+            except json.JSONDecodeError:
+                pass
+            break
+    if proc.returncode != 0 or not result:
+        tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
+        raise RuntimeError('; '.join(tail) or f'exit code {proc.returncode}')
+    job['database'] = {'added': time.time(), 'sheet': 'scaffold',
+                       'scan': result.get('scan'), 'replaced': bool(result.get('replaced')),
+                       'run': result.get('run'), 'scaffold': result.get('scaffold'),
+                       'labeled': result.get('labeled'),
+                       'n_scaffold': result.get('n_scaffold'), 'xlsx': result.get('xlsx')}
+    save_jobs()
+    return job['database']
+
+
 def add_job_to_database(job) -> dict:
     """Upsert one finished run into the study spreadsheet via
     7_build_database.py --add-job (features are extracted first if missing)."""
@@ -1094,6 +1383,8 @@ class Handler(BaseHTTPRequestHandler):
 
         elif route == '/api/config':
             self._json({'data_root': str(DATA_ROOT),
+                        'roots': [str(r) for r in ALLOWED_ROOTS],
+                        'scaffold_root': str(SCAFFOLD_ROOT) if SCAFFOLD_ROOT.is_dir() else None,
                         'bone_threshold': DEFAULT_BONE_THRESHOLD,
                         'index': INDEX_STATE['status'],
                         'indexed_scans': len(SCAN_INDEX)})
@@ -1116,7 +1407,8 @@ class Handler(BaseHTTPRequestHandler):
                 resp['patient_id'] = str(getattr(ds, 'PatientID', '') or '')
             except Exception:                           # noqa: BLE001
                 pass
-            resp['exvivo_guess'] = scan_is_exvivo(scan_dir)
+            resp['scaffold_guess'] = scan_is_scaffold(scan_dir)
+            resp['exvivo_guess'] = (not resp['scaffold_guess']) and scan_is_exvivo(scan_dir)
             if known:
                 resp['scan_path'] = known
                 ctx = detect_context(Path(known))
@@ -1162,7 +1454,12 @@ class Handler(BaseHTTPRequestHandler):
                 zpath.parent.mkdir(parents=True, exist_ok=True)
                 tmp = zpath.with_suffix('.part')
                 with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
-                    for suf in SERIES_SUFFIXES:
+                    if job.get('mode') == 'scaffold':
+                        for f in sorted(os.listdir(out.parent)):
+                            fp = out.parent / f
+                            if not f.startswith('.') and fp.is_file():
+                                z.write(fp, f)
+                    for suf in (SERIES_SUFFIXES if job.get('mode') != 'scaffold' else []):
                         d = out.parent / (out.name + suf)
                         if d.is_dir():
                             for f in sorted(os.listdir(d)):
@@ -1212,7 +1509,9 @@ class Handler(BaseHTTPRequestHandler):
             if not p.is_dir():
                 return self._err('input directory not found')
             ctx = detect_context(p)
-            if scan_is_exvivo(p):
+            if ctx.get('scaffold'):
+                pass                                   # already complete
+            elif scan_is_exvivo(p):
                 ctx['exvivo'] = True
                 pid = read_patient_id(first_dcm(p))
                 sample = '_'.join(x for x in (pid, p.name) if x)
@@ -1235,6 +1534,12 @@ class Handler(BaseHTTPRequestHandler):
             job = JOBS.get(jid)
             if not job:
                 return self._err('no such job', 404)
+            if job.get('mode') == 'scaffold' and not job.get('database') \
+                    and job.get('status') in ('done', 'done_warn'):
+                d = scaffold_db_entry(job)
+                if d:
+                    job['database'] = d
+                    save_jobs()
             out = dict(job)
             out['display_status'] = display_status(job.get('status'))
             lp = job_log_path(jid)
@@ -1411,7 +1716,17 @@ class Handler(BaseHTTPRequestHandler):
                 'scan_type': str(um.get('scan_type') or 'auto').strip(),
                 'notes': str(um.get('notes') or '').strip() or None}
 
-        if scan_is_exvivo(input_dir) or \
+        if ctx.get('scaffold') or \
+                (user_meta and user_meta['scan_type'].replace(' ', '') == 'scaffold'):
+            # In vitro scaffold (Dr. Ren): gold quantification, no ROI at all.
+            mode = 'scaffold'
+            placement_note += ' — in vitro scaffold, gold-labelled cells'
+            if user_meta:
+                ctx = scaffold_context(input_dir, sample=user_meta['sample'])
+            sample = sanitize_component(ctx['subject'])
+            folder = SCAFFOLD_OUTPUTS_DIR / f'{sample}_scaffold'
+            output = folder / f'{sample}_scaffold'
+        elif scan_is_exvivo(input_dir) or \
                 (user_meta and user_meta['scan_type'].replace(' ', '') == 'exvivo'):
             # Ex vivo specimen: geometric placement, no timepoint/reference.
             mode = 'exvivo'
@@ -1456,7 +1771,11 @@ class Handler(BaseHTTPRequestHandler):
                              'pattern — give the scan a different sample name')
 
         context = {k: ctx.get(k) for k in ('subject', 'group', 'timepoint')}
-        if user_meta:
+        if mode == 'scaffold':
+            context['scaffold'] = True
+            if user_meta and not context['group']:
+                context['group'] = user_meta['treatment']
+        elif user_meta:
             context = {'subject': user_meta['sample'],
                        'group': user_meta['treatment'],
                        'timepoint': user_meta['timepoint']}
@@ -1553,8 +1872,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _start_job(self, p):
         mode = p.get('mode')
-        if mode not in ('3m', 'later_reg', 'later_raw', 'exvivo'):
-            return self._err('mode must be 3m, later_reg, later_raw or exvivo')
+        if mode not in ('3m', 'later_reg', 'later_raw', 'exvivo', 'scaffold'):
+            return self._err('mode must be 3m, later_reg, later_raw, exvivo or scaffold')
         input_dir = Path(p.get('input') or '')
         if not p.get('input') or not input_dir.is_dir() or count_dcm(input_dir, cap=10) == 0:
             return self._err('input directory does not exist or contains no .dcm files')
@@ -1571,8 +1890,11 @@ class Handler(BaseHTTPRequestHandler):
         if output.resolve() == input_dir.resolve() or \
                 input_dir.resolve() in output.resolve().parents:
             return self._err('output must not be the input directory')
-        exists = any((output.parent / (output.name + s)).exists()
-                     for s in SERIES_SUFFIXES)
+        if mode == 'scaffold':
+            exists = (output.parent / (output.name + '.json')).exists()
+        else:
+            exists = any((output.parent / (output.name + s)).exists()
+                         for s in SERIES_SUFFIXES)
         if exists and not p.get('overwrite'):
             return self._err(f'output series "{output.name}" already exists — '
                              'tick Overwrite to replace it')
@@ -1594,6 +1916,8 @@ class Handler(BaseHTTPRequestHandler):
         job = {'id': jid, 'created': time.time(), 'status': 'queued',
                'mode': mode,
                'label': p.get('label') or output.name,
+               'context': ({'subject': input_dir.name, 'scaffold': True}
+                           if mode == 'scaffold' else None),
                'params': {'input': str(input_dir), 'output': str(output),
                           'ref_input': p.get('ref_input'),
                           'ref_roi': p.get('ref_roi'),
