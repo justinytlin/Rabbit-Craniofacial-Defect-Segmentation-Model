@@ -219,6 +219,14 @@ floor gold, bottom gold) plus the 0.02 % control ceiling. ~4 s per scan.
 Group-level statistics still come from the study's own
 `analysis/group_stats.py`, not from this script.
 
+Key-finding figures: `python 13_scaffold_figures.py` reads the scaffold tab and
+the per-scan depth profiles and writes six figures plus
+`key_findings_summary.csv` to `Dr. Ren/results/key_findings/` — label
+detection vs controls, the surface crust (density vs depth, cumulative
+share), deep signal at control level, radial position by scaffold, gold by
+run / dose, and representative sections. Statistics match `Dr. Ren/REPORT.md`
+(Mann-Whitney, Kruskal-Wallis + Holm, R2–R4).
+
 Spreadsheet: `python 7_build_database.py --add-scaffold-job JOB_ID [--add-scaffold-job …]`
 upserts finished web-app scaffold runs into the `scaffold` tab (the web app
 does this itself after every passed run). Hand edits to the identity / note
