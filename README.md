@@ -227,6 +227,15 @@ share), deep signal at control level, radial position by scaffold, gold by
 run / dose, and representative sections. Statistics match `Dr. Ren/REPORT.md`
 (Mann-Whitney, Kruskal-Wallis + Holm, R2–R4).
 
+Publication figures: `Rscript 14_scaffold_pub_figures.R` (ggplot2 + ggpubr /
+rstatix, ggbeeswarm, patchwork, pheatmap; Arial; 600 dpi PNG + vector PDF)
+writes `Dr. Ren/results/publication/` — Fig1 label detection vs controls and
+threshold robustness, Fig2 eight metrics compared across CG / MC / PEG-MC
+(Kruskal–Wallis + Holm-adjusted pairwise Wilcoxon), Fig3 depth profiles,
+Fig4 z-score heatmap + PCA, Fig5 run / dose — with `statistics.csv` (every
+test) and `figure_legends.md`. Needs R ≥ 4.3 with those packages
+(`install.packages(c("ggpubr","rstatix","patchwork","pheatmap","ggbeeswarm","svglite","ragg"))`).
+
 Spreadsheet: `python 7_build_database.py --add-scaffold-job JOB_ID [--add-scaffold-job …]`
 upserts finished web-app scaffold runs into the `scaffold` tab (the web app
 does this itself after every passed run). Hand edits to the identity / note
