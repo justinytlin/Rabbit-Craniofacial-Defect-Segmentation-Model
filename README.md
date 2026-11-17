@@ -236,6 +236,19 @@ Fig4 z-score heatmap + PCA, Fig5 run / dose — with `statistics.csv` (every
 test) and `figure_legends.md`. Needs R ≥ 4.3 with those packages
 (`install.packages(c("ggpubr","rstatix","patchwork","pheatmap","ggbeeswarm","svglite","ragg"))`).
 
+Radiomic features of the scaffolds themselves: `python 15_scaffold_radiomics.py`
+runs the feature functions of `6_extract_features.py` (same 113 features) on
+two regions per scan — the whole scaffold VOI, and its interior deeper than
+0.25 mm (no cell crust) — at 0.074 mm voxels, with texture on 32 grey levels
+over a fixed −600…1000 HU window (the bone window would collapse scaffolds
+into three grey levels). Output: `Dr. Ren/results/radiomics/scaffold_radiomics.csv`
++ per-scan JSON. `Rscript 16_scaffold_radiomics_figures.R` then compares
+CG / MC / PEG-MC feature by feature (Kruskal–Wallis with BH FDR, a
+run-adjusted ANOVA, Holm pairwise) and writes `results/radiomics/figures/`:
+heatmaps, PCA + feature screen, top feature per family, whole vs interior,
+`radiomics_feature_tests.csv` and legends. These features are not comparable
+with the rabbit database (different region, window and voxel size).
+
 Spreadsheet: `python 7_build_database.py --add-scaffold-job JOB_ID [--add-scaffold-job …]`
 upserts finished web-app scaffold runs into the `scaffold` tab (the web app
 does this itself after every passed run). Hand edits to the identity / note
