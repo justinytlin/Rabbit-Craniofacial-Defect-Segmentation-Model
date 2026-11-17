@@ -4,7 +4,7 @@
 # Input : Dr. Ren/results/radiomics/scaffold_radiomics.csv  (15_scaffold_radiomics.py —
 #         113 features × 2 regions per scan: whole scaffold, and interior > 0.25 mm deep)
 # Output: Dr. Ren/results/radiomics/figures/
-#   RadFig1_heatmap_<region>     all features, rank-normalised, scans clustered
+#   RadFig1_heatmap_<region>     all features, rank-normalised, scans in CG / MC / PEG-MC blocks
 #   RadFig2_feature_screen       PCA + per-feature effect size vs FDR + per-family tally (whole)
 #   RadFig3_top_features_<region> the most discriminating feature of each family, boxplots
 #   RadFig4_whole_vs_interior    do the differences survive removing the cell crust?
@@ -156,18 +156,24 @@ heat <- function(region) {
   feats <- tt$feature
   Z <- feature_matrix(region, feats)
   sf <- factor(super_family(as.character(tt$family)), levels = names(FAM_COL))
-  ord <- unlist(lapply(levels(sf), function(l) {          # cluster within family, keep families contiguous
-    idx <- which(sf == l); if (length(idx) < 3) return(idx)
-    idx[hclust(dist(t(Z[, idx])), "ward.D2")$order] }))
-  Z <- Z[, ord]; sf <- sf[ord]
-  gaps <- head(cumsum(table(sf)[levels(sf)]), -1)
+  # Rows: three blocks, CG / MC / PEG-MC, scans clustered within their own material.
+  row_ord <- unlist(lapply(levels(lab$scaffold), function(l) {
+    idx <- which(lab$scaffold == l); if (length(idx) < 3) return(idx)
+    idx[hclust(dist(Z[idx, ]), "ward.D2")$order] }))
+  gaps_r <- head(cumsum(table(lab$scaffold)[levels(lab$scaffold)]), -1)
+  # Columns: families contiguous; within a family, ordered by the CG-vs-mineralised contrast
+  # (mean score in CG minus mean score in MC and PEG-MC) so the split reads left to right.
+  contrast <- colMeans(Z[lab$scaffold == "CG", , drop = FALSE]) - colMeans(Z[lab$scaffold != "CG", , drop = FALSE])
+  col_ord <- unlist(lapply(levels(sf), function(l) { idx <- which(sf == l); idx[order(contrast[idx])] }))
+  Z <- Z[row_ord, col_ord]; sf <- sf[col_ord]
+  gaps_c <- head(cumsum(table(sf)[levels(sf)]), -1)
   ann_c <- data.frame(Family = sf, row.names = colnames(Z))
-  ann_r <- data.frame(Scaffold = lab$scaffold, Run = lab$run, row.names = lab$scan)
+  ann_r <- data.frame(Scaffold = lab$scaffold[row_ord], row.names = rownames(Z))
   pheatmap(Z, color = colorRampPalette(c("#2a78d6", "#f0efec", "#e34948"))(101), breaks = seq(-2.2, 2.2, length.out = 102),
-           cluster_cols = FALSE, cluster_rows = TRUE, clustering_method = "ward.D2", gaps_col = gaps,
+           cluster_cols = FALSE, cluster_rows = FALSE, gaps_col = gaps_c, gaps_row = gaps_r,
            annotation_col = ann_c, annotation_row = ann_r,
-           annotation_colors = list(Scaffold = PAL, Run = c(R2 = "#9ec5f4", R3 = "#5598e7", R4 = "#1c5cab"), Family = FAM_COL),
-           show_colnames = FALSE, fontsize = 6.5, fontsize_row = 5.5, border_color = NA, treeheight_row = 18,
+           annotation_colors = list(Scaffold = PAL, Family = FAM_COL),
+           show_colnames = FALSE, fontsize = 6.5, fontsize_row = 5.5, border_color = NA,
            fontfamily = FONT, silent = TRUE)
 }
 for (rg in c("whole", "interior")) {
@@ -287,7 +293,7 @@ legends <- c(
   "# Radiomic comparison of scaffold materials — figure legends", "",
   sprintf("Data: %d PLL-AuNP-labelled scaffolds from runs R2–R4 (CG n = %d, MC n = %d, PEG-MC n = %d); unlabelled controls (n = %d, one per material and run) are drawn as grey crosses and are not tested. %d radiomic features per region (first-order intensity, threshold-based, GLCM, GLRLM, GLSZM, GLDM, NGTDM, dense-phase morphometry) extracted with the feature code of the rabbit pipeline (6_extract_features.py) on 0.074 mm voxels; texture on 32 grey levels over a fixed −600 to 1000 HU window; the 226 HU threshold selects the dense phase (mineral particles and gold). Regions: whole scaffold volume, and interior (deeper than 0.25 mm below the seeded surface, i.e. without the labelled-cell crust). Per feature: Kruskal–Wallis across materials with epsilon² effect size and Benjamini–Hochberg FDR; and a run-adjusted type-II ANOVA of the rank-normalised feature on scaffold + run. 'Robust' = q < 0.05 in both.",
           nrow(lab), n_lab["CG"], n_lab["MC"], n_lab["PEG-MC"], nrow(ctrl), length(feats_all)), "",
-  "**RadFig1. All radiomic features.** Rank-based inverse-normal scores per feature (columns, grouped by family and clustered within family) for every labelled scan (rows, Ward clustering); row strips give material and run. One file per region.", "",
+  "**RadFig1. All radiomic features, by material.** Rank-based inverse-normal scores per feature for every labelled scan. Rows are split into three blocks, CG, MC and PEG-MC, with scans clustered within their own material (Ward). Columns are grouped by feature family; within a family, features are ordered by the difference between CG and the two mineralised scaffolds. One file per region.", "",
   sprintf("**RadFig2. Feature screen, whole scaffold.** (A) Principal components of the rank-normalised feature matrix; 68%% normal ellipses per material; the subtitle gives the share of each component explained by material and by run. (B) Effect size against FDR for each feature; labelled points are the seven robust features with the largest effect. (C) Number of features per family by test outcome. %d of %d features are robust. Strongest: %s.",
           rob_w, nrow(tw), topn(tw)), "",
   "**RadFig3. The most discriminating feature of each family.** Boxes: median and interquartile range; points: scans (symbol = run); grey crosses: unlabelled controls of the same material. Brackets: Holm-adjusted pairwise Wilcoxon p. Subtitles give the feature's FDR q for the Kruskal–Wallis test and, after the bar, for the run-adjusted test. One file per region.", "",
