@@ -23,6 +23,9 @@
 #   RadFig1_heatmap_<region>   21 features x scans, rows split CG / MC / PEG-MC
 #   RadFig2_panel_<region>     every panel feature as a boxplot
 #   RadFig3_summary            effect size of each feature in both regions + PCA
+#   RadFig4_batch_correction_<region>  PCA before / after ComBat, variance by run vs material, pairwise PERMANOVA
+#   RadFig1_heatmap_<region>_batchcorrected  the heatmap on ComBat-corrected features
+#   radiomics_batch_permanova.csv, ../scaffold_radiomics_panel_combat_<region>.csv
 #   radiomics_panel_tests.csv  the 21 features x 2 regions: medians, tests, effect sizes
 #   radiomics_all_feature_tests.csv  all extracted features with a size-dependence flag
 #   figure_legends.md
@@ -186,9 +189,10 @@ all_tests <- map_dfr(c("interior", "whole"), function(rg) {
 write_csv(mutate(all_tests, across(where(is.numeric), ~ signif(.x, 4))), file.path(OUT, "radiomics_all_feature_tests.csv"))
 
 # ── Figure 1: heatmap, rows split by material, panel features in fixed theme order ──
-heat <- function(rg) {
+heat <- function(rg, X = NULL) {
   L <- lab_of(rg)
-  Z <- sapply(KEYS, function(k) rank_norm(L[[k]])); Z[is.na(Z)] <- 0
+  Z <- if (is.null(X)) sapply(KEYS, function(k) rank_norm(L[[k]])) else apply(X, 2, rank_norm)
+  Z[is.na(Z)] <- 0
   rownames(Z) <- L$scan; colnames(Z) <- PANEL$short
   row_ord <- unlist(lapply(levels(L$scaffold), function(l) {
     idx <- which(L$scaffold == l); idx[hclust(dist(Z[idx, ]), "ward.D2")$order] }))
@@ -271,6 +275,107 @@ f3b <- ggplot(sc, aes(PC1, PC2)) +
   theme(legend.position = "bottom", legend.box = "vertical", legend.spacing.y = unit(0, "mm"))
 save_fig(wrap_elements(full = f3a) + wrap_elements(full = f3b) + plot_layout(widths = c(1.6, 1)), "RadFig3_summary", 180, 125)
 
+# ── Batch (run) effects: ComBat harmonisation + run-blocked PERMANOVA ─────────
+# Every material is present in every run (CG 3/3/3, MC 6/3/5, PEG-MC 3/3/6), so run
+# is not confounded with material and can be modelled. Two complementary steps:
+#   TEST      PERMANOVA on the UNCORRECTED 21-feature matrix, material adjusted for
+#             run (marginal term) with permutations restricted within run. This is the
+#             valid inference: testing data that were first corrected with the group
+#             protected exaggerates group differences (Nygaard et al., Biostatistics 2016).
+#   DISPLAY   ComBat (sva; Johnson et al. 2007) with material as a protected covariate,
+#             for the PCA / heatmap. A second ComBat run blind to material is the
+#             conservative check: it cannot manufacture a material difference.
+suppressPackageStartupMessages({ library(sva); library(vegan) })
+quiet <- function(expr) { out <- NULL; invisible(capture.output(out <- suppressMessages(expr))); out }
+tf <- function(y) if (all(y > 0, na.rm = TRUE) && max(y, na.rm = TRUE) / min(y, na.rm = TRUE) > 30) log10(y) else y
+batch_data <- function(rg) {
+  L <- as.data.frame(lab_of(rg)) %>% mutate(run = droplevels(run))
+  X <- sapply(KEYS, function(k) tf(L[[k]]))
+  for (j in seq_len(ncol(X))) { bad <- !is.finite(X[, j])
+    if (any(bad)) X[bad, j] <- ave(X[, j], L$scaffold, FUN = function(v) median(v[is.finite(v)]))[bad] }
+  rownames(X) <- L$scan
+  list(L = L, raw = X,
+       combat = t(quiet(ComBat(dat = t(X), batch = L$run, mod = model.matrix(~ scaffold, data = L), par.prior = TRUE))),
+       blind  = t(quiet(ComBat(dat = t(X), batch = L$run, mod = NULL, par.prior = TRUE))))
+}
+permanova <- function(X, L, nperm = 9999) {
+  D <- dist(scale(X)); set.seed(20261117)
+  a_mat <- adonis2(D ~ run + scaffold, data = L, by = "margin", permutations = how(nperm = nperm, blocks = L$run))
+  set.seed(20261117)
+  a_run <- adonis2(D ~ run + scaffold, data = L, by = "margin", permutations = how(nperm = nperm, blocks = L$scaffold))
+  set.seed(20261117)
+  disp <- permutest(betadisper(D, L$scaffold), permutations = 999)$tab[1, "Pr(>F)"]
+  tibble(term = c("run", "material"), R2 = c(a_run["run", "R2"], a_mat["scaffold", "R2"]),
+         F = c(a_run["run", "F"], a_mat["scaffold", "F"]), p = c(a_run["run", "Pr(>F)"], a_mat["scaffold", "Pr(>F)"]),
+         dispersion_p = disp)
+}
+pairwise_permanova <- function(X, L) {
+  pr <- combn(levels(L$scaffold), 2, simplify = FALSE)
+  map_dfr(pr, function(g) {
+    keep <- L$scaffold %in% g; Ls <- droplevels(L[keep, ])
+    r <- permanova(X[keep, , drop = FALSE], Ls)
+    tibble(pair = paste(g, collapse = " vs "), R2 = r$R2[2], F = r$F[2], p = r$p[2])
+  }) %>% mutate(p_holm = p.adjust(p, "holm"))
+}
+pcs <- function(X, L) { pc <- prcomp(scale(X)); ve <- 100 * pc$sdev^2 / sum(pc$sdev^2)
+  list(sc = tibble(PC1 = pc$x[, 1], PC2 = pc$x[, 2], scaffold = L$scaffold, run = L$run), ve = ve) }
+
+BATCH <- list(); PERM <- list(); PAIR <- list()
+for (rg in names(REG)) {
+  B <- batch_data(rg); BATCH[[rg]] <- B
+  PERM[[rg]] <- bind_rows(mutate(permanova(B$raw, B$L), data = "uncorrected (run in the model) — the test"),
+                          mutate(permanova(B$combat, B$L), data = "after ComBat, material protected — descriptive"),
+                          mutate(permanova(B$blind, B$L), data = "after ComBat, blind to material — conservative")) %>%
+    mutate(region = rg, .before = 1)
+  PAIR[[rg]] <- mutate(pairwise_permanova(B$raw, B$L), region = rg, .before = 1)
+  write_csv(bind_cols(select(B$L, scan, scaffold, run), as_tibble(signif(B$combat, 6))),
+            file.path(dirname(OUT), paste0("scaffold_radiomics_panel_combat_", rg, ".csv")))
+  save_fig(wrap_elements(full = heat(rg, B$combat)$gtable), paste0("RadFig1_heatmap_", rg, "_batchcorrected"), 180, 128)
+
+  pm <- PERM[[rg]]; pw <- PAIR[[rg]]
+  r2 <- function(d, t) 100 * pm$R2[grepl(d, pm$data) & pm$term == t]
+  before <- pcs(B$raw, B$L); after <- pcs(B$combat, B$L)
+  cen <- before$sc %>% group_by(run) %>% summarise(PC1 = mean(PC1), PC2 = mean(PC2))
+  base <- list(scale_colour_manual(values = PAL, name = NULL), scale_shape_manual(values = SHP, name = "Run"),
+               theme(legend.position = "bottom", legend.box = "horizontal"))
+  fa <- ggplot(before$sc, aes(PC1, PC2)) +
+    stat_ellipse(aes(group = run), type = "norm", level = 0.68, colour = MUTED, linewidth = 0.4, linetype = "22") +
+    geom_point(aes(colour = scaffold, shape = run), size = 1.8) +
+    geom_label(data = cen, aes(label = run), size = 2.2, colour = INK2, fill = "white", linewidth = 0, label.padding = unit(0.6, "mm"), family = FONT) +
+    labs(x = sprintf("PC1 (%.0f%%)", before$ve[1]), y = sprintf("PC2 (%.0f%%)", before$ve[2]), tag = "A", title = "Before correction",
+         subtitle = sprintf("Run explains %.0f%% of feature variance, material %.0f%%\nGrey ellipses: runs", r2("uncorrected", "run"), r2("uncorrected", "material"))) + base
+  fb <- ggplot(after$sc, aes(PC1, PC2)) +
+    stat_ellipse(aes(colour = scaffold), type = "norm", level = 0.68, linewidth = 0.4, linetype = "22") +
+    geom_point(aes(colour = scaffold, shape = run), size = 1.8) +
+    labs(x = sprintf("PC1 (%.0f%%)", after$ve[1]), y = sprintf("PC2 (%.0f%%)", after$ve[2]), tag = "B", title = "After ComBat (run removed)",
+         subtitle = sprintf("Run explains %.0f%%, material %.0f%%\nColoured ellipses: materials", r2("material protected", "run"), r2("material protected", "material"))) + base
+  bars <- pm %>% mutate(stage = factor(case_when(grepl("uncorrected", data) ~ "Before", grepl("protected", data) ~ "ComBat", TRUE ~ "ComBat,\nblind to material"),
+                                       levels = c("Before", "ComBat", "ComBat,\nblind to material")),
+                        term = factor(ifelse(term == "run", "Run (batch)", "Material"), levels = c("Run (batch)", "Material")))
+  fc <- ggplot(bars, aes(stage, 100 * R2, fill = term)) +
+    geom_col(position = position_dodge(0.7), width = 0.62, colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = sprintf("%.0f%%", 100 * R2)), position = position_dodge(0.7), vjust = -0.4, size = 2.2, colour = INK2, family = FONT) +
+    scale_fill_manual(values = c(`Run (batch)` = LIGHT, Material = INK2), name = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(x = NULL, y = "Feature variance explained (%)", tag = "C", title = "What drives the 21 features") +
+    theme(legend.position = "bottom")
+  fd <- ggplot(pw, aes(100 * R2, factor(pair, levels = rev(pair)))) +
+    geom_col(width = 0.55, fill = INK2) +
+    geom_text(aes(label = paste0("Holm p ", p_fmt(p_holm))), hjust = -0.08, size = 2.3, colour = INK2, family = FONT) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.45))) +
+    labs(x = "Variance explained by material, run-adjusted (%)", y = NULL, tag = "D", title = "Pairwise separation",
+         subtitle = sprintf("Overall material effect: PERMANOVA p %s", p_fmt(pm$p[grepl("uncorrected", pm$data) & pm$term == "material"])))
+  ttl <- theme(plot.title = element_text(size = 8, face = "bold", colour = INK))
+  save_fig(((fa + ttl) | (fb + ttl)) / ((fc + ttl) | (fd + ttl)) + plot_layout(heights = c(1.15, 1)),
+           paste0("RadFig4_batch_correction_", rg), 180, 165)
+  cat(sprintf("%s PERMANOVA (uncorrected, run-adjusted): material R2 %.3f p %s | run R2 %.3f p %s | dispersion p %s\n", rg,
+              pm$R2[2], p_fmt(pm$p[2]), pm$R2[1], p_fmt(pm$p[1]), p_fmt(pm$dispersion_p[1])))
+  cat(sprintf("   pairwise: %s\n", paste(sprintf("%s R2 %.3f Holm p %s", pw$pair, pw$R2, p_fmt(pw$p_holm)), collapse = "; ")))
+}
+write_csv(bind_rows(bind_rows(PERM) %>% transmute(region, analysis = data, comparison = term, R2, F, p, p_holm = NA, dispersion_p),
+                    bind_rows(PAIR) %>% transmute(region, analysis = "uncorrected (run in the model) — pairwise", comparison = pair, R2, F, p, p_holm, dispersion_p = NA)) %>%
+            mutate(across(where(is.numeric), ~ signif(.x, 4))), file.path(OUT, "radiomics_batch_permanova.csv"))
+
 # ── legends ───────────────────────────────────────────────────────────────────
 cnt <- function(rg) sum(filter(panel_tests, region == rg)$status == ROB)
 robust_names <- function(rg) paste(filter(panel_tests, region == rg, status == ROB) %>% arrange(desc(epsilon2)) %>% pull(label), collapse = "; ")
@@ -283,5 +388,10 @@ legends <- c(
   "**RadFig2. Every panel feature.** Boxes: median and interquartile range; points: scans (symbol = run); grey crosses: unlabelled controls of the same material. Under each feature name: its theme, then the FDR q of the Kruskal–Wallis test and, after the bar, of the run-adjusted test. One file per region.", "",
   sprintf("**RadFig3. Summary.** (A) Size of the difference between materials for each feature, in the interior (filled; material without the cell crust) and the whole scaffold (open); shade marks the test outcome (robust = q < 0.05 in both tests). (B) Principal components of the 21 features in the interior with 68%% normal ellipses per material. Robust features: %d of 21 in the interior, %d of 21 in the whole scaffold. Among the interior robust features the pairwise differences are CG vs MC in %d, CG vs PEG-MC in %d and MC vs PEG-MC in %d. Interior robust features, largest effect first: %s.",
           cnt("interior"), cnt("whole"), sum(pt$holm_CG_MC < 0.05), sum(pt$holm_CG_PEGMC < 0.05), sum(pt$holm_MC_PEGMC < 0.05), robust_names("interior")), "")
+pmi <- PERM[["interior"]]; pwi <- PAIR[["interior"]]
+legends <- c(legends,
+  sprintf("**RadFig4. Batch (run) effects and separation of the materials.** Run is the culture and scanning session (R2, R3, R4); every material is present in every run. (A) Principal components of the 21 features before correction; grey ellipses mark runs. (B) After ComBat harmonisation of run with material as a protected covariate; coloured ellipses mark materials. (C) Share of total feature variance explained by run and by material (marginal PERMANOVA R², Euclidean distance on standardised features) before correction, after ComBat, and after a ComBat run blind to material. (D) Pairwise separation of the materials from the run-adjusted PERMANOVA on the uncorrected data, with permutations restricted within run and Holm correction. Inference comes from the uncorrected, run-adjusted model: interior, material R² = %.2f, p %s; run R² = %.2f, p %s; dispersion test p %s. ComBat-corrected data are for display only, because testing data corrected with the group protected overstates group differences. Pairwise (interior): %s. One file per region; RadFig1_heatmap_<region>_batchcorrected shows the corrected features.",
+          pmi$R2[2], p_fmt(pmi$p[2]), pmi$R2[1], p_fmt(pmi$p[1]), p_fmt(pmi$dispersion_p[1]),
+          paste(sprintf("%s R² %.2f, Holm p %s", pwi$pair, pwi$R2, p_fmt(pwi$p_holm)), collapse = "; ")), "")
 writeLines(legends, file.path(OUT, "figure_legends.md"))
 cat("Done:", OUT, "\n")

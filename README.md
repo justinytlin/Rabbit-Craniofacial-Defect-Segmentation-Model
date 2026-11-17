@@ -254,7 +254,15 @@ region, whole scaffold alongside), `radiomics_panel_tests.csv`, legends.
 CG scaffolds are smaller (≈ 7.5 vs 8.1–8.3 mm across), so features that scale
 with region size by definition are expressed per unit volume (component
 count, NGTDM coarseness and busyness); `radiomics_all_feature_tests.csv`
-flags size-dependent features among all 111. An earlier p-value-ranked screen
+flags size-dependent features among all 111. Batch (run) effects: every material is in every run, so run is modelled
+rather than ignored. Inference is a PERMANOVA (vegan) on the uncorrected
+21-feature matrix with material adjusted for run and permutations
+restricted within run; ComBat (sva) with material protected is used for
+display only (`RadFig4_batch_correction_<region>`, the `_batchcorrected`
+heatmaps, `scaffold_radiomics_panel_combat_<region>.csv`), with a
+material-blind ComBat run as the conservative check. Needs
+`install.packages("vegan"); BiocManager::install("sva")`.
+An earlier p-value-ranked screen
 was withdrawn because its top features tracked region volume. These features
 are not comparable with the rabbit database (different region, window and
 voxel size).
