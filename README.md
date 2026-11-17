@@ -243,11 +243,21 @@ two regions per scan — the whole scaffold VOI, and its interior deeper than
 over a fixed −600…1000 HU window (the bone window would collapse scaffolds
 into three grey levels). Output: `Dr. Ren/results/radiomics/scaffold_radiomics.csv`
 + per-scan JSON. `Rscript 16_scaffold_radiomics_figures.R` then compares
-CG / MC / PEG-MC feature by feature (Kruskal–Wallis with BH FDR, a
-run-adjusted ANOVA, Holm pairwise) and writes `results/radiomics/figures/`:
-heatmaps, PCA + feature screen, top feature per family, whole vs interior,
-`radiomics_feature_tests.csv` and legends. These features are not comparable
-with the rabbit database (different region, window and voxel size).
+CG / MC / PEG-MC on the SAME pre-specified 21-feature panel and five themes
+as the Defect vs Soaked-OPG vs C-OPG figures (`9_opg_figures.py`), relabelled
+for scaffolds ("dense phase" instead of bone; no defect : reference ratio).
+Every panel feature is shown — nothing is picked by p-value. Tests:
+Kruskal–Wallis with BH FDR over the 21 features, a run-adjusted ANOVA, Holm
+pairwise. Output in `results/radiomics/figures/`: heatmap split by material,
+all 21 features as boxplots, effect-size summary + PCA (interior = primary
+region, whole scaffold alongside), `radiomics_panel_tests.csv`, legends.
+CG scaffolds are smaller (≈ 7.5 vs 8.1–8.3 mm across), so features that scale
+with region size by definition are expressed per unit volume (component
+count, NGTDM coarseness and busyness); `radiomics_all_feature_tests.csv`
+flags size-dependent features among all 111. An earlier p-value-ranked screen
+was withdrawn because its top features tracked region volume. These features
+are not comparable with the rabbit database (different region, window and
+voxel size).
 
 Spreadsheet: `python 7_build_database.py --add-scaffold-job JOB_ID [--add-scaffold-job …]`
 upserts finished web-app scaffold runs into the `scaffold` tab (the web app

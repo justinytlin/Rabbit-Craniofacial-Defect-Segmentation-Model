@@ -1,31 +1,45 @@
 #!/usr/bin/env Rscript
-# Radiomic-feature comparison of Dr. Ren's scaffold materials: CG vs MC vs PEG-MC.
+# Radiomic comparison of Dr. Ren's scaffold materials: CG vs MC vs PEG-MC.
 #
-# Input : Dr. Ren/results/radiomics/scaffold_radiomics.csv  (15_scaffold_radiomics.py —
-#         113 features × 2 regions per scan: whole scaffold, and interior > 0.25 mm deep)
+# Uses the SAME pre-specified 21-feature panel, in the same five themes, as the
+# rabbit Defect vs Soaked-OPG vs C-OPG figures (9_opg_figures.py: HEAT_COMMON /
+# IV_FAMILIES), so both studies present the same features. Nothing is selected
+# by p-value; every panel feature is shown.
+#
+# Adaptations forced by the specimen (no bone, no reference ring, free-form region):
+#   * "BV/TV" / "bone" -> dense fraction / dense phase (> 226 HU: mineral particles, gold);
+#   * no defect : reference ratio — a scaffold has no surrounding ring;
+#   * three features scale with region size BY DEFINITION and CG scaffolds are smaller
+#     (about 7.5 mm vs 8.1–8.3 mm across), so they are expressed per unit volume:
+#       component count -> components per mm3; NGTDM coarseness -> x voxels;
+#       NGTDM busyness -> per 1,000 voxels.
+#     (In the rabbit study the ROI is a fixed template, so this never arises there.)
+#     2026-11-17: an earlier version of this script ranked all 111 features by p-value;
+#     its top features (GLRLM / GLSZM / GLDM non-uniformity, NGTDM coarseness) tracked
+#     region volume (rho 0.88–0.99) and were withdrawn.
+#
+# Input : Dr. Ren/results/radiomics/scaffold_radiomics.csv  (15_scaffold_radiomics.py)
 # Output: Dr. Ren/results/radiomics/figures/
-#   RadFig1_heatmap_<region>     all features, rank-normalised, scans in CG / MC / PEG-MC blocks
-#   RadFig2_feature_screen       PCA + per-feature effect size vs FDR + per-family tally (whole)
-#   RadFig3_top_features_<region> the most discriminating feature of each family, boxplots
-#   RadFig4_whole_vs_interior    do the differences survive removing the cell crust?
-#   radiomics_feature_tests.csv  every feature × region: medians, tests, effect sizes
+#   RadFig1_heatmap_<region>   21 features x scans, rows split CG / MC / PEG-MC
+#   RadFig2_panel_<region>     every panel feature as a boxplot
+#   RadFig3_summary            effect size of each feature in both regions + PCA
+#   radiomics_panel_tests.csv  the 21 features x 2 regions: medians, tests, effect sizes
+#   radiomics_all_feature_tests.csv  all extracted features with a size-dependence flag
 #   figure_legends.md
+# Regions: interior (> 0.25 mm below the seeded surface; material without the cell
+# crust — the primary region) and whole (entire scaffold VOI).
 #
 # Statistics (labelled scaffolds, runs R2–R4; duplicate rescan excluded):
-#   per feature  Kruskal–Wallis across the three materials, epsilon² effect size,
-#                Benjamini–Hochberg FDR across features (q);
-#   run-adjusted type-II ANOVA of the rank-normalised feature ~ scaffold + run
-#                (R4 scaffolds are intrinsically brighter), BH-adjusted;
-#   "robust"     q < 0.05 in BOTH tests;
-#   boxplots     pairwise Wilcoxon, Holm-adjusted.
-# Stack: ggplot2, ggpubr/rstatix, ggbeeswarm, ggrepel, patchwork, pheatmap, ragg/cairo.
+#   Kruskal–Wallis across materials, epsilon2 effect size, Benjamini–Hochberg FDR over
+#   the 21 panel features (q); run-adjusted type-II ANOVA of the rank-normalised
+#   feature ~ scaffold + run (BH); "robust" = q < 0.05 in both; pairwise Wilcoxon, Holm.
+# Stack: ggplot2, ggpubr/rstatix, ggbeeswarm, patchwork, pheatmap, ragg/cairo.
 #
 #   Rscript 16_scaffold_radiomics_figures.R
 
 suppressPackageStartupMessages({
   library(ggplot2); library(dplyr); library(tidyr); library(readr); library(tibble); library(purrr)
-  library(ggpubr); library(rstatix); library(patchwork); library(pheatmap)
-  library(ggbeeswarm); library(ggrepel); library(grid)
+  library(ggpubr); library(rstatix); library(patchwork); library(pheatmap); library(ggbeeswarm); library(grid)
 })
 options(warn = 1, dplyr.summarise.inform = FALSE)
 
@@ -37,20 +51,20 @@ IN    <- file.path(ROOT, "results", "radiomics", "scaffold_radiomics.csv")
 OUT   <- file.path(ROOT, "results", "radiomics", "figures")
 dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
 
-# ── palette & theme (same as 14_scaffold_pub_figures.R) ───────────────────────
+# ── palette & theme ───────────────────────────────────────────────────────────
 PAL   <- c(CG = "#2a78d6", MC = "#eb6834", `PEG-MC` = "#1baf7a")
-INK <- "#0b0b0b"; INK2 <- "#52514e"; MUTED <- "#898781"; LIGHT <- "#c3c2b7"; FAINT <- "#e1e0d9"
+INK <- "#0b0b0b"; INK2 <- "#52514e"; MUTED <- "#898781"; LIGHT <- "#c3c2b7"
 SHP   <- c(R2 = 16, R3 = 17, R4 = 15)
-FAM_COL <- c(`First-order intensity` = "#eda100", `Threshold / dense fraction` = "#e87ba4",
-             `GLCM` = "#008300", `Run / zone / dependence` = "#6250d6",
-             `Dense-phase morphometry` = "#e34948")
+THEMES <- c("Dense material amount", "Dense-phase density", "Dense-phase structure",
+            "Intensity distribution", "Texture")
+THEME_COL <- setNames(c("#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"), THEMES)
 FONT  <- "Arial"
 theme_set(theme_pubr(base_size = 8, base_family = FONT, legend = "right") +
   theme(axis.line = element_line(linewidth = 0.3), axis.ticks = element_line(linewidth = 0.3),
         axis.text = element_text(colour = INK2), axis.title = element_text(colour = INK),
         plot.tag = element_text(face = "bold", size = 10),
         plot.subtitle = element_text(size = 7, colour = INK2),
-        strip.background = element_blank(), strip.text = element_text(face = "bold", size = 8),
+        strip.background = element_blank(), strip.text = element_text(face = "bold", size = 7.5),
         legend.key.size = unit(3.5, "mm"), legend.text = element_text(size = 7),
         legend.title = element_text(size = 7.5)))
 p_fmt <- function(p) ifelse(is.na(p), "n/a", ifelse(p < 0.001, "< 0.001", ifelse(p < 0.01, sprintf("= %.3f", p), sprintf("= %.2f", p))))
@@ -60,244 +74,214 @@ save_fig <- function(p, name, w, h) {
          device = ragg::agg_png, bg = "white")
   cat("  wrote", name, "\n")
 }
+rank_norm <- function(x) { r <- rank(x, na.last = "keep"); qnorm((r - 0.5) / sum(!is.na(x))) }
 
-# ── feature vocabulary ────────────────────────────────────────────────────────
-THRESH <- c("bvtv_fixed", "bone_mean_hu", "otsu_threshold_hu", "bvtv_otsu", "multiotsu_t1_hu",
-            "multiotsu_t2_hu", "fraction_low", "fraction_mid", "fraction_high")
-family <- function(f) case_when(
-  grepl("^glcm_", f) ~ "GLCM", grepl("^glrlm_", f) ~ "GLRLM", grepl("^glszm_", f) ~ "GLSZM",
-  grepl("^gldm_", f) ~ "GLDM", grepl("^ngtdm_", f) ~ "NGTDM",
-  f %in% THRESH ~ "Threshold / dense fraction", grepl("^bone_", f) ~ "Dense-phase morphometry",
-  TRUE ~ "First-order intensity")
-FAM_LEVELS <- c("First-order intensity", "Threshold / dense fraction", "GLCM", "GLRLM", "GLSZM",
-                "GLDM", "NGTDM", "Dense-phase morphometry")
-super_family <- function(fam) ifelse(fam %in% c("GLRLM", "GLSZM", "GLDM", "NGTDM"), "Run / zone / dependence", fam)
-SPECIAL <- c(bvtv_fixed = "Dense fraction (> 226 HU)", bone_mean_hu = "Dense-phase mean HU",
-             bvtv_otsu = "Fraction above Otsu threshold", otsu_threshold_hu = "Otsu threshold",
-             multiotsu_t1_hu = "Multi-Otsu lower threshold", multiotsu_t2_hu = "Multi-Otsu upper threshold",
-             mean_hu = "Mean intensity", std_hu = "Intensity SD", median_hu = "Median intensity",
-             iqr_hu = "Interquartile range", rms_hu = "Root-mean-square intensity",
-             mean_abs_dev_hu = "Mean absolute deviation", entropy_bits = "Histogram entropy",
-             p10_hu = "10th percentile", p25_hu = "25th percentile", p75_hu = "75th percentile",
-             p90_hu = "90th percentile", min_hu = "Minimum intensity", max_hu = "Maximum intensity",
-             range_hu = "Intensity range")
-pretty <- function(f) {
-  out <- ifelse(f %in% names(SPECIAL), SPECIAL[f], f)
-  out <- sub("^glcm_", "GLCM ", out); out <- sub("^glrlm_", "GLRLM ", out); out <- sub("^glszm_", "GLSZM ", out)
-  out <- sub("^gldm_", "GLDM ", out); out <- sub("^ngtdm_", "NGTDM ", out); out <- sub("^bone_", "Dense-phase ", out)
-  out <- sub("_bits$", "", out); out <- sub("_mm3$", " volume", out); out <- sub("_mm2$", "", out); out <- sub("_mm$", "", out)
-  out <- sub("_hu$", "", out)
-  unname(gsub("_", " ", out))
-}
-unit_of <- function(f) case_when(grepl("_hu$", f) ~ " (HU)", grepl("_mm3$", f) ~ " (mm³)", grepl("_mm2$", f) ~ " (mm²)",
-                                 grepl("_mm$", f) ~ " (mm)", grepl("_bits$", f) ~ " (bits)", TRUE ~ "")
+# ── the feature panel (same 21 features and themes as 9_opg_figures.py) ───────
+PANEL <- tribble(
+  ~theme,                   ~key,                        ~label,                               ~short,
+  "Dense material amount",  "dense_pct",                 "Dense fraction, > 226 HU (%)",       "Dense fraction",
+  "Dense material amount",  "mean_hu",                   "Mean intensity (HU)",                "Mean HU",
+  "Dense material amount",  "p90_hu",                    "90th percentile (HU)",               "P90 HU",
+  "Dense-phase density",    "bone_mean_hu",              "Dense-phase mean intensity (HU)",    "Dense-phase mean HU",
+  "Dense-phase structure",  "comp_density",              "Dense components (per mm³)",         "Components / mm³",
+  "Dense-phase structure",  "bone_volume_to_surface_mm", "Dense-phase volume / surface (mm)",  "Volume / surface",
+  "Dense-phase structure",  "bone_sphericity",           "Dense-phase sphericity",             "Sphericity",
+  "Dense-phase structure",  "bone_solidity",             "Dense-phase solidity",               "Solidity",
+  "Intensity distribution", "std_hu",                    "Intensity SD (HU)",                  "SD HU",
+  "Intensity distribution", "skewness",                  "Skewness",                           "Skewness",
+  "Intensity distribution", "kurtosis",                  "Kurtosis",                           "Kurtosis",
+  "Intensity distribution", "entropy_bits",              "Histogram entropy (bits)",           "Entropy",
+  "Texture",                "glcm_contrast",             "GLCM contrast",                      "GLCM contrast",
+  "Texture",                "glcm_homogeneity",          "GLCM homogeneity",                   "GLCM homogeneity",
+  "Texture",                "glcm_correlation",          "GLCM correlation",                   "GLCM correlation",
+  "Texture",                "glcm_entropy_bits",         "GLCM entropy (bits)",                "GLCM entropy",
+  "Texture",                "run_pct",                   "GLRLM run percentage (%)",           "GLRLM run %",
+  "Texture",                "zone_pct",                  "GLSZM zone percentage (%)",          "GLSZM zone %",
+  "Texture",                "glszm_large_area_emphasis", "GLSZM large-area emphasis",          "GLSZM large area",
+  "Texture",                "coarse_n",                  "NGTDM coarseness (size-normalised)", "NGTDM coarseness*",
+  "Texture",                "busy_n",                    "NGTDM busyness (per 1,000 voxels)",  "NGTDM busyness*"
+) %>% mutate(theme = factor(theme, levels = THEMES), key = factor(key, levels = key))
+KEYS <- as.character(PANEL$key)
 
 # ── data ──────────────────────────────────────────────────────────────────────
 raw <- read_csv(IN, col_types = cols(scan = col_character(), run = col_character(), batch = col_character(),
                                      scaffold = col_character(), labeled = col_character(), note = col_character(),
                                      .default = col_double()), progress = FALSE) %>%
-  filter(!grepl("duplicate", coalesce(note, ""))) %>%
+  filter(!grepl("duplicate", coalesce(note, "")), run %in% names(SHP)) %>%
   mutate(control = labeled %in% c("none", "unlabeled"),
-         scaffold = factor(scaffold, levels = names(PAL)),
-         main = run %in% names(SHP), run = factor(run, levels = c("R1", names(SHP))))
-feats_all <- sub("^whole_", "", grep("^whole_", names(raw), value = TRUE))
-feats_all <- setdiff(feats_all, c("region_voxels", "voxels", "volume_mm3"))   # region size is not a texture/intensity feature
-lab  <- filter(raw, main, !control) %>% mutate(run = droplevels(run))
-ctrl <- filter(raw, main, control) %>% mutate(run = droplevels(run))
-n_lab <- table(lab$scaffold)
-cat(sprintf("labelled R2–R4: %d scans (%s); controls: %d; %d features × 2 regions\n", nrow(lab),
-            paste(names(n_lab), n_lab, sep = "=", collapse = ", "), nrow(ctrl), length(feats_all)))
+         scaffold = factor(scaffold, levels = names(PAL)), run = factor(run, levels = names(SHP)))
 
-rank_norm <- function(x) { r <- rank(x, na.last = "keep"); qnorm((r - 0.5) / sum(!is.na(x))) }
+region_data <- function(rg) {
+  g <- function(f) raw[[paste0(rg, "_", f)]]
+  out <- tibble(scan = raw$scan, scaffold = raw$scaffold, run = raw$run, control = raw$control,
+                volume_mm3 = g("volume_mm3"),
+                dense_pct = 100 * g("bvtv_fixed"), mean_hu = g("mean_hu"), p90_hu = g("p90_hu"),
+                bone_mean_hu = g("bone_mean_hu"),
+                comp_density = g("bone_components") / g("volume_mm3"),
+                bone_volume_to_surface_mm = g("bone_volume_to_surface_mm"),
+                bone_sphericity = g("bone_sphericity"), bone_solidity = g("bone_solidity"),
+                std_hu = g("std_hu"), skewness = g("skewness"), kurtosis = g("kurtosis"), entropy_bits = g("entropy_bits"),
+                glcm_contrast = g("glcm_contrast"), glcm_homogeneity = g("glcm_homogeneity"),
+                glcm_correlation = g("glcm_correlation"), glcm_entropy_bits = g("glcm_entropy_bits"),
+                run_pct = 100 * g("glrlm_run_percentage"), zone_pct = 100 * g("glszm_zone_percentage"),
+                glszm_large_area_emphasis = g("glszm_large_area_emphasis"),
+                coarse_n = g("ngtdm_coarseness") * g("voxels"),
+                busy_n = 1000 * g("ngtdm_busyness") / g("voxels"))
+  stopifnot(all(KEYS %in% names(out)))
+  out
+}
+REG <- list(interior = region_data("interior"), whole = region_data("whole"))
+lab_of  <- function(rg) filter(REG[[rg]], !control)
+ctrl_of <- function(rg) filter(REG[[rg]], control)
+n_lab <- table(lab_of("interior")$scaffold)
+cat(sprintf("labelled R2-R4: %d scans (%s); controls: %d; panel: %d features\n", nrow(lab_of("interior")),
+            paste(names(n_lab), n_lab, sep = "=", collapse = ", "), nrow(ctrl_of("interior")), length(KEYS)))
 
-# ── per-feature tests ─────────────────────────────────────────────────────────
-test_region <- function(region) {
-  map_dfr(feats_all, function(f) {
-    y <- lab[[paste0(region, "_", f)]]
-    ok <- is.finite(y)
-    if (sum(ok) < 12 || sd(y[ok]) == 0) return(NULL)
-    df <- tibble(y = y[ok], scaffold = lab$scaffold[ok], run = lab$run[ok])
-    kw <- kruskal.test(y ~ scaffold, data = df)
-    df$z <- rank_norm(df$y)
-    av <- tryCatch(car::Anova(lm(z ~ scaffold + run, data = df), type = 2), error = function(e) NULL)
-    pw <- suppressWarnings(pairwise.wilcox.test(df$y, df$scaffold, p.adjust.method = "holm", exact = FALSE))$p.value
-    med <- tapply(df$y, df$scaffold, median)
-    tibble(region = region, feature = f, family = family(f), n = nrow(df),
-           median_CG = med[["CG"]], median_MC = med[["MC"]], median_PEGMC = med[["PEG-MC"]],
-           kw_H = unname(kw$statistic), kw_p = kw$p.value, epsilon2 = unname(kw$statistic) / (nrow(df) - 1),
-           run_adj_F = if (is.null(av)) NA else av["scaffold", "F value"],
-           run_adj_p = if (is.null(av)) NA else av["scaffold", "Pr(>F)"],
-           run_F = if (is.null(av)) NA else av["run", "F value"],
-           run_p = if (is.null(av)) NA else av["run", "Pr(>F)"],
-           holm_CG_MC = pw["MC", "CG"], holm_CG_PEGMC = pw["PEG-MC", "CG"], holm_MC_PEGMC = pw["PEG-MC", "MC"])
+# ── tests ─────────────────────────────────────────────────────────────────────
+test_one <- function(y, scaffold, run) {
+  ok <- is.finite(y)
+  df <- tibble(y = y[ok], scaffold = scaffold[ok], run = run[ok])
+  kw <- kruskal.test(y ~ scaffold, data = df)
+  df$z <- rank_norm(df$y)
+  av <- tryCatch(car::Anova(lm(z ~ scaffold + run, data = df), type = 2), error = function(e) NULL)
+  pw <- suppressWarnings(pairwise.wilcox.test(df$y, df$scaffold, p.adjust.method = "holm", exact = FALSE))$p.value
+  med <- tapply(df$y, df$scaffold, median)
+  tibble(n = nrow(df), median_CG = med[["CG"]], median_MC = med[["MC"]], median_PEGMC = med[["PEG-MC"]],
+         kw_H = unname(kw$statistic), kw_p = kw$p.value, epsilon2 = unname(kw$statistic) / (nrow(df) - 1),
+         run_adj_p = if (is.null(av)) NA else av["scaffold", "Pr(>F)"],
+         run_p = if (is.null(av)) NA else av["run", "Pr(>F)"],
+         holm_CG_MC = pw["MC", "CG"], holm_CG_PEGMC = pw["PEG-MC", "CG"], holm_MC_PEGMC = pw["PEG-MC", "MC"])
+}
+status_of <- function(kw_q, adj_q) factor(case_when(kw_q < 0.05 & adj_q < 0.05 ~ "Robust (both q < 0.05)",
+                                                    kw_q < 0.05 | adj_q < 0.05 ~ "One test only", TRUE ~ "Not significant"),
+                                          levels = c("Robust (both q < 0.05)", "One test only", "Not significant"))
+panel_tests <- map_dfr(names(REG), function(rg) {
+  L <- lab_of(rg)
+  map_dfr(KEYS, ~ bind_cols(tibble(region = rg, key = .x), test_one(L[[.x]], L$scaffold, L$run))) %>%
+    mutate(kw_q = p.adjust(kw_p, "BH"), run_adj_q = p.adjust(run_adj_p, "BH"), status = status_of(kw_q, run_adj_q))
+}) %>% left_join(mutate(select(PANEL, key, theme, label), key = as.character(key)), by = "key") %>%
+  mutate(key = factor(key, levels = KEYS)) %>% relocate(region, theme, key, label)
+write_csv(mutate(panel_tests, across(where(is.numeric), ~ signif(.x, 4))), file.path(OUT, "radiomics_panel_tests.csv"))
+ROB <- levels(panel_tests$status)[1]
+for (rg in names(REG)) with(filter(panel_tests, region == rg), cat(sprintf(
+  "%s: %d/%d robust | CG vs MC %d, CG vs PEG-MC %d, MC vs PEG-MC %d (Holm < 0.05 among robust)\n", rg,
+  sum(status == ROB), length(status), sum(holm_CG_MC[status == ROB] < 0.05), sum(holm_CG_PEGMC[status == ROB] < 0.05),
+  sum(holm_MC_PEGMC[status == ROB] < 0.05))))
+
+# All extracted features, with the size-dependence flag (exploratory table only — not plotted).
+all_feats <- setdiff(sub("^whole_", "", grep("^whole_", names(raw), value = TRUE)), c("region_voxels", "voxels", "volume_mm3"))
+all_tests <- map_dfr(c("interior", "whole"), function(rg) {
+  L <- filter(raw, !control); vol <- L[[paste0(rg, "_volume_mm3")]]
+  centre <- function(v) ave(rank(v, na.last = "keep"), L$scaffold, FUN = function(r) r - mean(r, na.rm = TRUE))
+  map_dfr(all_feats, function(f) {
+    y <- L[[paste0(rg, "_", f)]]
+    if (sum(is.finite(y)) < 12 || sd(y, na.rm = TRUE) == 0) return(NULL)
+    ct <- suppressWarnings(cor.test(centre(vol), centre(y), method = "spearman", exact = FALSE))
+    bind_cols(tibble(region = rg, feature = f, rho_volume = suppressWarnings(cor(vol, y, method = "spearman", use = "complete.obs")),
+                     rho_volume_within_material = unname(ct$estimate), p_volume_within_material = ct$p.value),
+              test_one(y, L$scaffold, L$run))
   }) %>% mutate(kw_q = p.adjust(kw_p, "BH"), run_adj_q = p.adjust(run_adj_p, "BH"),
-                run_q = p.adjust(run_p, "BH"),
-                status = factor(case_when(kw_q < 0.05 & run_adj_q < 0.05 ~ "Robust (both q < 0.05)",
-                                          kw_q < 0.05 | run_adj_q < 0.05 ~ "One test only",
-                                          TRUE ~ "Not significant"),
-                                levels = c("Robust (both q < 0.05)", "One test only", "Not significant")),
-                family = factor(family, levels = FAM_LEVELS))
-}
-tests <- bind_rows(test_region("whole"), test_region("interior"))
-write_csv(mutate(tests, across(where(is.numeric), ~ signif(.x, 4))), file.path(OUT, "radiomics_feature_tests.csv"))
-tw <- filter(tests, region == "whole"); ti <- filter(tests, region == "interior")
-cat(sprintf("whole: %d/%d robust; interior: %d/%d robust; run effect (whole) q<0.05: %d\n",
-            sum(tw$status == levels(tw$status)[1]), nrow(tw), sum(ti$status == levels(ti$status)[1]), nrow(ti),
-            sum(tw$run_q < 0.05, na.rm = TRUE)))
+                size_dependent = abs(rho_volume_within_material) > 0.5 & p_volume_within_material < 0.01)
+})
+write_csv(mutate(all_tests, across(where(is.numeric), ~ signif(.x, 4))), file.path(OUT, "radiomics_all_feature_tests.csv"))
 
-# ── Figure 1: heatmap of all features ─────────────────────────────────────────
-feature_matrix <- function(region, feats) {
-  M <- as.matrix(lab[, paste0(region, "_", feats)]); rownames(M) <- lab$scan; colnames(M) <- feats
-  Z <- apply(M, 2, rank_norm); Z[is.na(Z)] <- 0; rownames(Z) <- lab$scan
-  Z
-}
-heat <- function(region) {
-  tt <- filter(tests, region == !!region)
-  feats <- tt$feature
-  Z <- feature_matrix(region, feats)
-  sf <- factor(super_family(as.character(tt$family)), levels = names(FAM_COL))
-  # Rows: three blocks, CG / MC / PEG-MC, scans clustered within their own material.
-  row_ord <- unlist(lapply(levels(lab$scaffold), function(l) {
-    idx <- which(lab$scaffold == l); if (length(idx) < 3) return(idx)
-    idx[hclust(dist(Z[idx, ]), "ward.D2")$order] }))
-  gaps_r <- head(cumsum(table(lab$scaffold)[levels(lab$scaffold)]), -1)
-  # Columns: families contiguous; within a family, ordered by the CG-vs-mineralised contrast
-  # (mean score in CG minus mean score in MC and PEG-MC) so the split reads left to right.
-  contrast <- colMeans(Z[lab$scaffold == "CG", , drop = FALSE]) - colMeans(Z[lab$scaffold != "CG", , drop = FALSE])
-  col_ord <- unlist(lapply(levels(sf), function(l) { idx <- which(sf == l); idx[order(contrast[idx])] }))
-  Z <- Z[row_ord, col_ord]; sf <- sf[col_ord]
-  gaps_c <- head(cumsum(table(sf)[levels(sf)]), -1)
-  ann_c <- data.frame(Family = sf, row.names = colnames(Z))
-  ann_r <- data.frame(Scaffold = lab$scaffold[row_ord], row.names = rownames(Z))
+# ── Figure 1: heatmap, rows split by material, panel features in fixed theme order ──
+heat <- function(rg) {
+  L <- lab_of(rg)
+  Z <- sapply(KEYS, function(k) rank_norm(L[[k]])); Z[is.na(Z)] <- 0
+  rownames(Z) <- L$scan; colnames(Z) <- PANEL$short
+  row_ord <- unlist(lapply(levels(L$scaffold), function(l) {
+    idx <- which(L$scaffold == l); idx[hclust(dist(Z[idx, ]), "ward.D2")$order] }))
+  Z <- Z[row_ord, ]
+  ann_c <- data.frame(Theme = PANEL$theme, row.names = colnames(Z))
+  ann_r <- data.frame(Scaffold = L$scaffold[row_ord], row.names = rownames(Z))
   pheatmap(Z, color = colorRampPalette(c("#2a78d6", "#f0efec", "#e34948"))(101), breaks = seq(-2.2, 2.2, length.out = 102),
-           cluster_cols = FALSE, cluster_rows = FALSE, gaps_col = gaps_c, gaps_row = gaps_r,
-           annotation_col = ann_c, annotation_row = ann_r,
-           annotation_colors = list(Scaffold = PAL, Family = FAM_COL),
-           show_colnames = FALSE, fontsize = 6.5, fontsize_row = 5.5, border_color = NA,
-           fontfamily = FONT, silent = TRUE)
+           cluster_cols = FALSE, cluster_rows = FALSE,
+           gaps_col = head(cumsum(table(PANEL$theme)), -1), gaps_row = head(cumsum(table(L$scaffold)), -1),
+           annotation_col = ann_c, annotation_row = ann_r, annotation_colors = list(Scaffold = PAL, Theme = THEME_COL),
+           angle_col = 90, cellwidth = 13.5, cellheight = 7, fontsize = 6.2, fontsize_row = 5.5, fontsize_col = 6.5,
+           border_color = NA, fontfamily = FONT, silent = TRUE)
 }
-for (rg in c("whole", "interior")) {
-  h <- heat(rg)
-  save_fig(wrap_elements(full = h$gtable), paste0("RadFig1_heatmap_", rg), 180, 105)
-}
+for (rg in names(REG)) save_fig(wrap_elements(full = heat(rg)$gtable), paste0("RadFig1_heatmap_", rg), 180, 128)
 
-# ── PCA helper ────────────────────────────────────────────────────────────────
-pca_plot <- function(region, tag = NULL) {
-  tt <- filter(tests, region == !!region)
-  Z <- feature_matrix(region, tt$feature)
-  pc <- prcomp(Z, center = TRUE, scale. = FALSE)
-  ve <- 100 * pc$sdev^2 / sum(pc$sdev^2)
-  sc <- as_tibble(pc$x[, 1:2]) %>% mutate(scan = rownames(Z), scaffold = lab$scaffold, run = lab$run)
-  # does material or run explain the leading components?
-  r2 <- function(v, g) summary(lm(v ~ g))$r.squared
-  sub <- sprintf("PC1: material R² %.2f, run R² %.2f  |  PC2: material R² %.2f, run R² %.2f",
-                 r2(sc$PC1, sc$scaffold), r2(sc$PC1, sc$run), r2(sc$PC2, sc$scaffold), r2(sc$PC2, sc$run))
-  p <- ggplot(sc, aes(PC1, PC2)) +
-    stat_ellipse(aes(colour = scaffold), type = "norm", level = 0.68, linewidth = 0.4, linetype = "22") +
-    geom_point(aes(colour = scaffold, shape = run), size = 1.8) +
-    scale_colour_manual(values = PAL, name = NULL) + scale_shape_manual(values = SHP, name = "Run") +
-    labs(x = sprintf("PC1 (%.0f%%)", ve[1]), y = sprintf("PC2 (%.0f%%)", ve[2]), subtitle = sub, tag = tag) +
-    theme(legend.position = "bottom", legend.box = "horizontal")
-  list(plot = p, ve = ve, r2 = c(pc1_mat = r2(sc$PC1, sc$scaffold), pc1_run = r2(sc$PC1, sc$run),
-                                 pc2_mat = r2(sc$PC2, sc$scaffold), pc2_run = r2(sc$PC2, sc$run)))
-}
-
-# ── Figure 2: feature screen (whole scaffold) ────────────────────────────────
-STAT_COL <- c(`Robust (both q < 0.05)` = INK, `One test only` = MUTED, `Not significant` = LIGHT)
-pcw <- pca_plot("whole", "A")
-top_lab <- tw %>% filter(status == levels(status)[1]) %>% arrange(desc(epsilon2)) %>% slice_head(n = 7)
-f2b <- ggplot(tw, aes(epsilon2, -log10(kw_q))) +
-  geom_hline(yintercept = -log10(0.05), linetype = "22", colour = MUTED, linewidth = 0.3) +
-  geom_point(aes(colour = status), size = 1.2, alpha = 0.9) +
-  geom_text_repel(data = top_lab, aes(label = pretty(feature)), size = 2.1, colour = INK2, family = FONT,
-                  segment.size = 0.2, segment.colour = MUTED, min.segment.length = 0, max.overlaps = Inf,
-                  direction = "y", hjust = 1, nudge_x = -0.22, xlim = c(NA, 0.36), box.padding = 0.3, force = 3) +
-  annotate("text", x = min(tw$epsilon2), y = -log10(0.05), label = "q = 0.05", hjust = 0, vjust = -0.5, size = 2.1, colour = MUTED) +
-  scale_colour_manual(values = STAT_COL, name = NULL) +
-  labs(x = expression("Effect size, Kruskal–Wallis " * epsilon^2), y = expression(-log[10] * " FDR q"), tag = "B",
-       subtitle = "Each point is one feature; shade as in C") +
-  theme(legend.position = "none")
-tally <- tw %>% count(family, status) %>% complete(family, status, fill = list(n = 0))
-f2c <- ggplot(tally, aes(n, forcats::fct_rev(family), fill = forcats::fct_rev(status))) +
-  geom_col(width = 0.6, colour = "white", linewidth = 0.4) +
-  scale_fill_manual(values = c(`Not significant` = FAINT, `One test only` = MUTED, `Robust (both q < 0.05)` = INK),
-                    name = NULL, guide = guide_legend(reverse = TRUE)) +
-  labs(x = "Number of features", y = NULL, tag = "C") + theme(legend.position = "bottom")
-fig2 <- wrap_elements(full = (pcw$plot | f2b)) / f2c + plot_layout(heights = c(1, 0.62))
-save_fig(fig2, "RadFig2_feature_screen", 180, 150)
-
-# ── Figure 3: top feature per family ──────────────────────────────────────────
-top_panel <- function(region, f, tag) {
-  col <- paste0(region, "_", f)
-  tt <- filter(tests, region == !!region, feature == f)
-  df <- lab %>% transmute(scaffold, run, y = .data[[col]]) %>% filter(is.finite(y))
-  dc <- ctrl %>% transmute(scaffold, run, y = .data[[col]]) %>% filter(is.finite(y))
+# ── Figure 2: every panel feature as a boxplot ────────────────────────────────
+box_panel <- function(rg, k, tag) {
+  info <- filter(PANEL, key == k); tt <- filter(panel_tests, region == rg, key == k)
+  df <- lab_of(rg) %>% transmute(scaffold, run, y = .data[[k]]) %>% filter(is.finite(y))
+  dc <- ctrl_of(rg) %>% transmute(scaffold, run, y = .data[[k]]) %>% filter(is.finite(y))
   ally <- c(df$y, dc$y)
   use_log <- all(ally > 0) && max(ally) / min(ally) > 30
   pw <- wilcox_test(df, y ~ scaffold, p.adjust.method = "holm")
   yv <- if (use_log) log10(ally) else ally
   top <- max(yv); rng <- diff(range(yv)); if (rng == 0) rng <- 1
-  pos <- top + rng * (0.08 + 0.13 * (seq_len(nrow(pw)) - 1))
+  pos <- top + rng * (0.12 + 0.24 * (seq_len(nrow(pw)) - 1))
   pw$y.position <- if (use_log) 10^pos else pos
   pw$label <- paste("p", p_fmt(pw$p.adj))
+  lab_fn <- scales::label_number(scale_cut = scales::cut_short_scale())
   p <- ggplot(df, aes(scaffold, y)) +
     geom_boxplot(aes(fill = scaffold), outlier.shape = NA, width = 0.55, linewidth = 0.3, alpha = 0.35, colour = INK2) +
-    geom_beeswarm(aes(colour = scaffold, shape = run), size = 1.2, cex = 2.6) +
-    geom_point(data = dc, aes(scaffold, y), shape = 4, colour = MUTED, size = 1.4, stroke = 0.5,
-               position = position_nudge(x = 0.38)) +
+    geom_beeswarm(aes(colour = scaffold, shape = run), size = 1.1, cex = 2.6) +
+    geom_point(data = dc, aes(scaffold, y), shape = 4, colour = MUTED, size = 1.3, stroke = 0.5, position = position_nudge(x = 0.38)) +
     scale_fill_manual(values = PAL, guide = "none") + scale_colour_manual(values = PAL, guide = "none") +
     scale_shape_manual(values = SHP, name = "Run") +
-    stat_pvalue_manual(pw, label = "label", tip.length = 0.01, size = 2.2, bracket.size = 0.3) +
-    labs(x = NULL, y = paste0(pretty(f), unit_of(f)), tag = tag,
-         title = sub("Threshold / dense fraction", "Threshold-based", sub("Dense-phase morphometry", "Dense-phase shape", as.character(tt$family))),
-         subtitle = sprintf("q %s | run-adj. q %s", p_fmt(tt$kw_q), p_fmt(tt$run_adj_q))) +
-    theme(plot.title = element_text(size = 7.5, face = "bold", colour = INK), plot.title.position = "panel",
-          plot.subtitle = element_text(size = 6.3, colour = INK2), axis.title.y = element_text(size = 7))
-  lab_fn <- scales::label_number(scale_cut = scales::cut_short_scale())
-  if (use_log) p + scale_y_log10(labels = lab_fn, expand = expansion(mult = c(0.05, 0.06))) else
-    p + scale_y_continuous(labels = lab_fn, expand = expansion(mult = c(0.05, 0.06)))
+    stat_pvalue_manual(pw, label = "label", tip.length = 0.01, size = 2.1, bracket.size = 0.3) +
+    labs(x = NULL, y = NULL, tag = tag, title = paste(strwrap(info$label, width = 23), collapse = "\n"),
+         subtitle = sprintf("%s\nq %s | run-adj. q %s", info$theme, p_fmt(tt$kw_q), p_fmt(tt$run_adj_q))) +
+    theme(plot.title = element_text(size = 7, face = "bold", colour = INK, lineheight = 0.95), plot.title.position = "panel",
+          plot.subtitle = element_text(size = 6.1, colour = INK2, lineheight = 1.0), axis.text.x = element_text(size = 7))
+  if (use_log) p + scale_y_log10(labels = lab_fn, expand = expansion(mult = c(0.05, 0.10))) else
+    p + scale_y_continuous(labels = lab_fn, expand = expansion(mult = c(0.05, 0.10)))
 }
-top_fig <- function(region) {
-  pick <- filter(tests, region == !!region) %>% group_by(family) %>% arrange(run_adj_p, desc(epsilon2)) %>% slice_head(n = 1) %>% ungroup() %>% arrange(family)
-  panels <- map2(pick$feature, LETTERS[seq_len(nrow(pick))], ~ top_panel(region, .x, .y))
-  wrap_plots(panels, ncol = 4) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+for (rg in names(REG)) {
+  panels <- map2(KEYS, LETTERS[seq_along(KEYS)], ~ box_panel(rg, .x, .y))
+  fig <- wrap_plots(panels, ncol = 4) + guide_area() + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+  save_fig(fig, paste0("RadFig2_panel_", rg), 180, 262)
 }
-for (rg in c("whole", "interior")) save_fig(top_fig(rg), paste0("RadFig3_top_features_", rg), 180, 135)
 
-# ── Figure 4: whole vs interior ───────────────────────────────────────────────
-both <- inner_join(select(tw, feature, family, e_whole = epsilon2, s_whole = status),
-                   select(ti, feature, e_int = epsilon2, s_int = status), by = "feature") %>%
-  mutate(cls = factor(case_when(s_whole == levels(s_whole)[1] & s_int == levels(s_int)[1] ~ "Robust in both regions",
-                                s_whole == levels(s_whole)[1] ~ "Robust in whole scaffold only",
-                                s_int == levels(s_int)[1] ~ "Robust in interior only", TRUE ~ "Neither"),
-                      levels = c("Robust in both regions", "Robust in whole scaffold only", "Robust in interior only", "Neither")))
-rho <- cor(both$e_whole, both$e_int, method = "spearman")
-f4a <- ggplot(both, aes(e_whole, e_int)) +
-  geom_abline(slope = 1, intercept = 0, colour = MUTED, linewidth = 0.3, linetype = "22") +
-  geom_point(aes(colour = cls, shape = cls), size = 1.4) +
-  scale_colour_manual(values = c(`Robust in both regions` = INK, `Robust in whole scaffold only` = MUTED,
-                                 `Robust in interior only` = MUTED, Neither = LIGHT), name = NULL) +
-  scale_shape_manual(values = c(`Robust in both regions` = 16, `Robust in whole scaffold only` = 17,
-                                `Robust in interior only` = 15, Neither = 16), name = NULL) +
-  labs(x = expression("Effect size " * epsilon^2 * ", whole scaffold"), y = expression("Effect size " * epsilon^2 * ", interior (> 0.25 mm deep)"),
-       subtitle = sprintf("Spearman ρ = %.2f across %d features", rho, nrow(both)), tag = "A") +
-  coord_equal() + theme(legend.position = "bottom", legend.direction = "vertical")
-pci <- pca_plot("interior", "B")
-fig4 <- (f4a | pci$plot) + plot_layout(widths = c(1, 1.1))
-save_fig(fig4, "RadFig4_whole_vs_interior", 180, 100)
+# ── Figure 3: effect size per feature (both regions) + PCA of the panel ───────
+es <- panel_tests %>% mutate(region = factor(region, levels = c("interior", "whole"),
+                                             labels = c("Interior", "Whole scaffold")),
+                             short = factor(PANEL$short[match(key, PANEL$key)], levels = rev(PANEL$short)))
+f3a <- ggplot(es, aes(epsilon2, short)) +
+  geom_line(aes(group = short), colour = LIGHT, linewidth = 0.4) +
+  geom_point(aes(shape = region, colour = status), size = 1.9, stroke = 0.7) +
+  facet_grid(rows = vars(theme), scales = "free_y", space = "free_y", switch = "y") +
+  scale_shape_manual(values = c(Interior = 16, `Whole scaffold` = 1), name = NULL) +
+  scale_colour_manual(values = c(`Robust (both q < 0.05)` = INK, `One test only` = MUTED, `Not significant` = LIGHT),
+                      labels = c("Robust", "One test", "n.s."), name = NULL) +
+  scale_x_continuous(limits = c(0, NA), expand = expansion(mult = c(0.02, 0.06))) +
+  labs(x = expression("Effect size, Kruskal–Wallis " * epsilon^2), y = NULL, tag = "A") +
+  theme(strip.placement = "outside", strip.text.y.left = element_text(angle = 0, hjust = 1, size = 6.8),
+        panel.spacing.y = unit(2, "mm"), legend.position = "bottom", legend.box = "vertical",
+        legend.spacing.y = unit(0, "mm"), axis.text.y = element_text(size = 6.8),
+        panel.grid.major.x = element_line(colour = "#e1e0d9", linewidth = 0.25))
+L <- lab_of("interior")
+Zp <- sapply(KEYS, function(k) rank_norm(L[[k]])); Zp[is.na(Zp)] <- 0
+pc <- prcomp(Zp, center = TRUE, scale. = FALSE); ve <- 100 * pc$sdev^2 / sum(pc$sdev^2)
+sc <- as_tibble(pc$x[, 1:2]) %>% mutate(scaffold = L$scaffold, run = L$run)
+r2 <- function(v, g) summary(lm(v ~ g))$r.squared
+R2 <- c(pc1_mat = r2(sc$PC1, sc$scaffold), pc1_run = r2(sc$PC1, sc$run), pc2_mat = r2(sc$PC2, sc$scaffold), pc2_run = r2(sc$PC2, sc$run))
+f3b <- ggplot(sc, aes(PC1, PC2)) +
+  stat_ellipse(aes(colour = scaffold), type = "norm", level = 0.68, linewidth = 0.4, linetype = "22") +
+  geom_point(aes(colour = scaffold, shape = run), size = 1.8) +
+  scale_colour_manual(values = PAL, name = NULL) + scale_shape_manual(values = SHP, name = "Run") +
+  labs(x = sprintf("PC1 (%.0f%%)", ve[1]), y = sprintf("PC2 (%.0f%%)", ve[2]), tag = "B",
+       subtitle = sprintf("Interior, 21 features\nPC1: material R² %.2f, run R² %.2f\nPC2: material R² %.2f, run R² %.2f",
+                          R2["pc1_mat"], R2["pc1_run"], R2["pc2_mat"], R2["pc2_run"])) +
+  theme(legend.position = "bottom", legend.box = "vertical", legend.spacing.y = unit(0, "mm"))
+save_fig(wrap_elements(full = f3a) + wrap_elements(full = f3b) + plot_layout(widths = c(1.6, 1)), "RadFig3_summary", 180, 125)
 
 # ── legends ───────────────────────────────────────────────────────────────────
-rob_w <- sum(tw$status == levels(tw$status)[1]); rob_i <- sum(ti$status == levels(ti$status)[1])
-topn <- function(t, k = 5) paste(pretty(head(arrange(filter(t, status == levels(t$status)[1]), run_adj_p)$feature, k)), collapse = "; ")
+cnt <- function(rg) sum(filter(panel_tests, region == rg)$status == ROB)
+robust_names <- function(rg) paste(filter(panel_tests, region == rg, status == ROB) %>% arrange(desc(epsilon2)) %>% pull(label), collapse = "; ")
+pt <- filter(panel_tests, region == "interior", status == ROB)
 legends <- c(
   "# Radiomic comparison of scaffold materials — figure legends", "",
-  sprintf("Data: %d PLL-AuNP-labelled scaffolds from runs R2–R4 (CG n = %d, MC n = %d, PEG-MC n = %d); unlabelled controls (n = %d, one per material and run) are drawn as grey crosses and are not tested. %d radiomic features per region (first-order intensity, threshold-based, GLCM, GLRLM, GLSZM, GLDM, NGTDM, dense-phase morphometry) extracted with the feature code of the rabbit pipeline (6_extract_features.py) on 0.074 mm voxels; texture on 32 grey levels over a fixed −600 to 1000 HU window; the 226 HU threshold selects the dense phase (mineral particles and gold). Regions: whole scaffold volume, and interior (deeper than 0.25 mm below the seeded surface, i.e. without the labelled-cell crust). Per feature: Kruskal–Wallis across materials with epsilon² effect size and Benjamini–Hochberg FDR; and a run-adjusted type-II ANOVA of the rank-normalised feature on scaffold + run. 'Robust' = q < 0.05 in both.",
-          nrow(lab), n_lab["CG"], n_lab["MC"], n_lab["PEG-MC"], nrow(ctrl), length(feats_all)), "",
-  "**RadFig1. All radiomic features, by material.** Rank-based inverse-normal scores per feature for every labelled scan. Rows are split into three blocks, CG, MC and PEG-MC, with scans clustered within their own material (Ward). Columns are grouped by feature family; within a family, features are ordered by the difference between CG and the two mineralised scaffolds. One file per region.", "",
-  sprintf("**RadFig2. Feature screen, whole scaffold.** (A) Principal components of the rank-normalised feature matrix; 68%% normal ellipses per material; the subtitle gives the share of each component explained by material and by run. (B) Effect size against FDR for each feature; labelled points are the seven robust features with the largest effect. (C) Number of features per family by test outcome. %d of %d features are robust. Strongest: %s.",
-          rob_w, nrow(tw), topn(tw)), "",
-  "**RadFig3. The most discriminating feature of each family.** Boxes: median and interquartile range; points: scans (symbol = run); grey crosses: unlabelled controls of the same material. Brackets: Holm-adjusted pairwise Wilcoxon p. Subtitles give the feature's FDR q for the Kruskal–Wallis test and, after the bar, for the run-adjusted test. One file per region.", "",
-  sprintf("**RadFig4. Are the differences intrinsic to the material?** (A) Effect size of each feature in the whole scaffold against the interior region that excludes the cell crust (dashed line = identity). (B) Principal components for the interior region. %d of %d interior features are robust. Strongest: %s.",
-          rob_i, nrow(ti), topn(ti)), "")
+  sprintf("Data: %d PLL-AuNP-labelled scaffolds from runs R2–R4 (CG n = %d, MC n = %d, PEG-MC n = %d); unlabelled controls (n = %d) are drawn as grey crosses and are not tested. Features: the pre-specified 21-feature panel of the rabbit Defect vs Soaked-OPG vs C-OPG figures, in the same five themes, extracted with the same code (6_extract_features.py) at 0.074 mm voxels; texture on 32 grey levels over a fixed −600 to 1000 HU window. 'Dense' = above 226 HU (mineral particles and gold); scaffolds contain no bone and have no reference ring, so there is no defect : reference ratio. CG scaffolds are smaller than MC and PEG-MC (about 7.5 mm versus 8.1–8.3 mm across), so the three features that scale with region size by definition are expressed per unit volume (marked *): component count per mm³, NGTDM coarseness × voxels, NGTDM busyness per 1,000 voxels. Regions: interior (deeper than 0.25 mm below the seeded surface, i.e. the material without the labelled-cell crust; primary) and whole scaffold. Tests: Kruskal–Wallis across materials with epsilon² effect size and Benjamini–Hochberg FDR over the 21 features; run-adjusted type-II ANOVA of the rank-normalised feature on scaffold + run; 'robust' = q < 0.05 in both; brackets are Holm-adjusted pairwise Wilcoxon p.",
+          nrow(L), n_lab["CG"], n_lab["MC"], n_lab["PEG-MC"], nrow(ctrl_of("interior"))), "",
+  "**RadFig1. Feature panel by material.** Rank-based inverse-normal scores of the 21 panel features (columns, fixed theme order) for every labelled scan (rows), split into CG, MC and PEG-MC blocks with scans clustered within their own material. One file per region.", "",
+  "**RadFig2. Every panel feature.** Boxes: median and interquartile range; points: scans (symbol = run); grey crosses: unlabelled controls of the same material. Under each feature name: its theme, then the FDR q of the Kruskal–Wallis test and, after the bar, of the run-adjusted test. One file per region.", "",
+  sprintf("**RadFig3. Summary.** (A) Size of the difference between materials for each feature, in the interior (filled; material without the cell crust) and the whole scaffold (open); shade marks the test outcome (robust = q < 0.05 in both tests). (B) Principal components of the 21 features in the interior with 68%% normal ellipses per material. Robust features: %d of 21 in the interior, %d of 21 in the whole scaffold. Among the interior robust features the pairwise differences are CG vs MC in %d, CG vs PEG-MC in %d and MC vs PEG-MC in %d. Interior robust features, largest effect first: %s.",
+          cnt("interior"), cnt("whole"), sum(pt$holm_CG_MC < 0.05), sum(pt$holm_CG_PEGMC < 0.05), sum(pt$holm_MC_PEGMC < 0.05), robust_names("interior")), "")
 writeLines(legends, file.path(OUT, "figure_legends.md"))
 cat("Done:", OUT, "\n")
